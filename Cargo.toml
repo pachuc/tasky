@@ -1,0 +1,19 @@
+[workspace]
+members = ["crates/*"]
+default-members = ["crates/tasky-core", "crates/tasky-store", "crates/tasky-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tempfile = "3"
+tasky-core = { path = "crates/tasky-core" }
+tasky-store = { path = "crates/tasky-store" }

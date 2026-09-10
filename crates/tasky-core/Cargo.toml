@@ -1,0 +1,9 @@
+[package]
+name = "tasky-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
