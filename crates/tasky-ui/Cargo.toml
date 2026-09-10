@@ -1,0 +1,12 @@
+[package]
+name = "tasky-ui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gpui = "=0.2.2"
+tasky-core.workspace = true
+tasky-store.workspace = true
