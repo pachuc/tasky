@@ -27,11 +27,11 @@ impl Render for Viewer {
             .tasks()
             .map(|task| {
                 let (state, color) = match &task.status {
-                    Status::Pending if self.graph.is_ready(task) => ("ready".into(), 0x4ade80),
-                    Status::Pending => ("blocked".into(), 0xfbbf24),
-                    Status::Running { agent } => (format!("running / {agent}"), 0x60a5fa),
-                    Status::Done => ("done".into(), 0xa1a1aa),
-                    Status::Failed { reason } => (format!("failed / {reason}"), 0xf87171),
+                    Status::Pending if self.graph.is_ready(task) => ("ready".into(), 0x004a_de80),
+                    Status::Pending => ("blocked".into(), 0x00fb_bf24),
+                    Status::Running { agent } => (format!("running / {agent}"), 0x0060_a5fa),
+                    Status::Done => ("done".into(), 0x00a1_a1aa),
+                    Status::Failed { reason } => (format!("failed / {reason}"), 0x00f8_7171),
                 };
                 let dependencies = task
                     .dependencies
@@ -43,14 +43,14 @@ impl Render for Viewer {
                     .p_3()
                     .mb_2()
                     .rounded_md()
-                    .bg(rgb(0x202938))
+                    .bg(rgb(0x0020_2938))
                     .child(
                         div()
                             .text_color(rgb(color))
                             .child(format!("{} · {}", task.id, state)),
                     )
                     .child(task.title.clone())
-                    .child(div().text_sm().text_color(rgb(0x9ca3af)).child(format!(
+                    .child(div().text_sm().text_color(rgb(0x009c_a3af)).child(format!(
                         "Requires: {}",
                         if dependencies.is_empty() {
                             "none"
@@ -67,8 +67,8 @@ impl Render for Viewer {
             .flex_col()
             .p_6()
             .gap_3()
-            .bg(rgb(0x111827))
-            .text_color(rgb(0xf3f4f6))
+            .bg(rgb(0x0011_1827))
+            .text_color(rgb(0x00f3_f4f6))
             .child(div().text_xl().child("Tasky / task graph"))
             .child(format!(
                 "{} tasks · {} ready",
@@ -81,7 +81,7 @@ impl Render for Viewer {
                     .cursor_pointer()
                     .p_2()
                     .rounded_md()
-                    .bg(rgb(0x374151))
+                    .bg(rgb(0x0037_4151))
                     .child("Refresh snapshot")
                     .on_click(cx.listener(|this, _, _, cx| {
                         match this.store.load() {
@@ -92,7 +92,7 @@ impl Render for Viewer {
                             Err(error) => {
                                 this.error = Some(format!(
                                     "Refresh failed (showing previous snapshot): {error:#}"
-                                ))
+                                ));
                             }
                         }
                         cx.notify();

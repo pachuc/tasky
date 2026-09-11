@@ -13,6 +13,8 @@ pub struct Store {
 }
 
 impl Store {
+    /// Select a store directory without reading or creating files.
+    #[must_use]
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
@@ -35,6 +37,10 @@ impl Store {
         Ok(lock) // OS unlocks when the handle is dropped, including on error.
     }
 
+    /// Create an empty graph without overwriting an existing snapshot.
+    ///
+    /// # Errors
+    /// Returns an error if a snapshot exists or locking or saving fails.
     pub fn init(&self) -> Result<Graph> {
         let _lock = self.lock()?;
         ensure!(!self.path().exists(), "graph already exists");
@@ -43,6 +49,10 @@ impl Store {
         Ok(graph)
     }
 
+    /// Read and validate the current snapshot.
+    ///
+    /// # Errors
+    /// Returns an error if the snapshot cannot be read, parsed, or validated.
     pub fn load(&self) -> Result<Graph> {
         let file = File::open(self.path()).context("cannot open graph; run `tasky init` first")?;
         let graph: Graph = serde_json::from_reader(file).context("invalid graph JSON")?;
@@ -50,6 +60,10 @@ impl Store {
         Ok(graph)
     }
 
+    /// Apply an action under the writer lock and save the validated graph.
+    ///
+    /// # Errors
+    /// Returns an error if locking, loading, the action, validation, or saving fails.
     pub fn update(&self, action: impl FnOnce(&mut Graph) -> Result<()>) -> Result<Graph> {
         let _lock = self.lock()?;
         let mut graph = self.load()?;

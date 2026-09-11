@@ -55,14 +55,23 @@ fn nonempty(value: &str) -> Result<()> {
 }
 
 impl Graph {
+    /// Iterate over tasks in ID order.
     pub fn tasks(&self) -> impl Iterator<Item = &Task> {
         self.tasks.values()
     }
 
+    /// Look up a task by ID.
+    ///
+    /// # Errors
+    /// Returns an error if the task does not exist.
     pub fn task(&self, id: &str) -> Result<&Task> {
         self.tasks.get(id).ok_or_else(|| Error::NotFound(id.into()))
     }
 
+    /// Insert a pending task with no dependencies.
+    ///
+    /// # Errors
+    /// Returns an error if the ID or title is blank, or the ID already exists.
     pub fn add(&mut self, id: String, title: String) -> Result<()> {
         nonempty(&id)?;
         nonempty(&title)?;
@@ -81,30 +90,36 @@ impl Graph {
         Ok(())
     }
 
-    // A -> B means A requires B. Check reachability before adding A -> B.
+    /// Require `dependency` to finish before `id` can be claimed.
+    ///
+    /// # Errors
+    /// Returns an error if either task is missing, `id` is not pending,
+    /// or the dependency would create a cycle.
     pub fn depend(&mut self, id: &str, dependency: &str) -> Result<()> {
         self.require_pending(id)?;
         self.task(dependency)?;
         if self.reaches(dependency, id) {
             return Err(Error::Invalid("dependency would create a cycle".into()));
         }
-        self.tasks
-            .get_mut(id)
-            .unwrap()
-            .dependencies
-            .insert(dependency.into());
+        self.task_mut(id)?.dependencies.insert(dependency.into());
         Ok(())
     }
 
+    /// Remove a prerequisite from a pending task.
+    ///
+    /// # Errors
+    /// Returns an error if either task is missing or `id` is not pending.
     pub fn undepend(&mut self, id: &str, dependency: &str) -> Result<()> {
         self.require_pending(id)?;
         self.task(dependency)?;
+        self.task_mut(id)?.dependencies.remove(dependency);
+        Ok(())
+    }
+
+    fn task_mut(&mut self, id: &str) -> Result<&mut Task> {
         self.tasks
             .get_mut(id)
-            .unwrap()
-            .dependencies
-            .remove(dependency);
-        Ok(())
+            .ok_or_else(|| Error::NotFound(id.into()))
     }
 
     fn reaches(&self, from: &str, target: &str) -> bool {
@@ -130,6 +145,8 @@ impl Graph {
         Ok(())
     }
 
+    /// Whether a task is pending and all its prerequisites are done.
+    #[must_use]
     pub fn is_ready(&self, task: &Task) -> bool {
         task.status == Status::Pending
             && task
@@ -138,19 +155,30 @@ impl Graph {
                 .all(|id| self.tasks.get(id).is_some_and(|t| t.status == Status::Done))
     }
 
+    /// Iterate over ready tasks in ID order.
     pub fn ready(&self) -> impl Iterator<Item = &Task> {
         self.tasks().filter(|task| self.is_ready(task))
     }
 
+    /// Assign a ready task to an agent and mark it running.
+    ///
+    /// # Errors
+    /// Returns an error if the agent is blank, the task is missing,
+    /// or the task is not ready.
     pub fn claim(&mut self, id: &str, agent: String) -> Result<()> {
         nonempty(&agent)?;
         if !self.is_ready(self.task(id)?) {
             return Err(Error::Invalid("task is not ready".into()));
         }
-        self.tasks.get_mut(id).unwrap().status = Status::Running { agent };
+        self.task_mut(id)?.status = Status::Running { agent };
         Ok(())
     }
 
+    /// Complete a running task, or fail it with the supplied reason.
+    ///
+    /// # Errors
+    /// Returns an error if the task is missing, is not running for this agent,
+    /// or the failure reason is blank.
     pub fn finish(&mut self, id: &str, agent: &str, failure: Option<String>) -> Result<()> {
         match &self.task(id)?.status {
             Status::Running { agent: owner } if owner == agent => {}
@@ -167,19 +195,28 @@ impl Graph {
             }
             None => Status::Done,
         };
-        self.tasks.get_mut(id).unwrap().status = status;
+        self.task_mut(id)?.status = status;
         Ok(())
     }
 
+    /// Return a failed task to pending.
+    ///
+    /// # Errors
+    /// Returns an error if the task is missing or is not failed.
     pub fn retry(&mut self, id: &str) -> Result<()> {
         if !matches!(self.task(id)?.status, Status::Failed { .. }) {
             return Err(Error::Invalid("only failed tasks can be retried".into()));
         }
-        self.tasks.get_mut(id).unwrap().status = Status::Pending;
+        self.task_mut(id)?.status = Status::Pending;
         Ok(())
     }
 
     /// Validate snapshots at the persistence boundary, including data written externally.
+    ///
+    /// # Errors
+    /// Returns an error for an unsupported schema, blank required fields,
+    /// mismatched task IDs, missing dependencies, cycles, or a started task
+    /// with an unfinished prerequisite.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != 1 {
             return Err(Error::Invalid("unsupported schema version".into()));

@@ -88,7 +88,7 @@ On Linux, install the development packages for X11/XCB, Wayland, xkbcommon,
 fontconfig, OpenSSL, and Vulkan, plus a C/C++ compiler, CMake and pkg-config.
 Consult GPUI's [Linux platform documentation](https://github.com/zed-industries/zed/tree/main/docs/src/development)
 for platform setup; upstream requirements may evolve. macOS requires Xcode command
-line tools. The CI template checks the UI on macOS; Windows support is not validated.
+line tools. CI checks the UI on macOS; Windows support is not validated.
 The viewer loads at startup and on **Refresh snapshot**. A refresh error retains
 and labels the last successful snapshot. Close the last window to exit.
 
@@ -99,8 +99,15 @@ cargo fmt --all -- --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 # Requires desktop development dependencies:
-cargo check --locked -p tasky-ui
+cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
+
+Every crate inherits the workspace lint policy from `Cargo.toml`: Rust forbids
+unsafe code in our crates, and Clippy denies its default and full pedantic groups
+plus `redundant_clone`, `needless_collect`, and `large_stack_frames`. These Clippy
+rules fail even without `-D warnings`; that flag also rejects other compiler
+warnings. New workspace crates must include `[lints]` with `workspace = true`.
+The unsafe-code restriction does not apply to third-party dependencies.
 
 | Crate | Responsibility |
 | --- | --- |
@@ -109,9 +116,9 @@ cargo check --locked -p tasky-ui
 | `tasky-cli` | CLI arguments and JSON presentation (`tasky` binary) |
 | `tasky-ui` | Read-only GPUI presentation (`tasky-ui` binary) |
 
-A GitHub Actions template is provided at [`ci/github-actions.yml.example`](ci/github-actions.yml.example).
-To enable CI, copy it to `.github/workflows/ci.yml` using credentials with workflow
-permission. It runs headless checks on Linux and a UI compile check on macOS.
+[GitHub Actions CI](.github/workflows/ci.yml) runs headless tests and checks on Linux
+and Clippy for the entire workspace, including the UI, on macOS. The same workflow
+is provided at [`ci/github-actions.yml.example`](ci/github-actions.yml.example).
 
 The committed lockfile covers the whole workspace. Storage currently targets
 small graphs on a local filesystem; all writers must use the store API. Network
