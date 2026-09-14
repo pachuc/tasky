@@ -19,6 +19,7 @@ fn parse_optional_time(field: &str, value: Option<&str>) -> Result<Option<Timest
 #[diesel(table_name = projects, treat_none_as_null = true)]
 pub struct ProjectRow {
     pub id: String,
+    pub parent_id: Option<String>,
     pub slug: String,
     pub name: String,
     pub repo_path: Option<String>,
@@ -33,6 +34,7 @@ impl TryFrom<ProjectRow> for Project {
         Ok(Self {
             created_at: parse_time("created_at", &row.created_at)?,
             id: row.id,
+            parent_id: row.parent_id,
             slug: row.slug,
             name: row.name,
             repo_path: row.repo_path,
@@ -45,6 +47,7 @@ impl From<&Project> for ProjectRow {
     fn from(project: &Project) -> Self {
         Self {
             id: project.id.clone(),
+            parent_id: project.parent_id.clone(),
             slug: project.slug.clone(),
             name: project.name.clone(),
             repo_path: project.repo_path.clone(),
@@ -59,6 +62,7 @@ impl From<&Project> for ProjectRow {
 pub struct GoalRow {
     pub id: String,
     pub project_id: String,
+    pub parent_id: Option<String>,
     pub slug: String,
     pub title: String,
     pub description: String,
@@ -80,6 +84,7 @@ impl TryFrom<GoalRow> for Goal {
             completed_at: parse_optional_time("completed_at", row.completed_at.as_deref())?,
             id: row.id,
             project_id: row.project_id,
+            parent_id: row.parent_id,
             slug: row.slug,
             title: row.title,
             description: row.description,
@@ -93,6 +98,7 @@ impl From<&Goal> for GoalRow {
         Self {
             id: goal.id.clone(),
             project_id: goal.project_id.clone(),
+            parent_id: goal.parent_id.clone(),
             slug: goal.slug.clone(),
             title: goal.title.clone(),
             description: goal.description.clone(),

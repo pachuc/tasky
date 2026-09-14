@@ -3,6 +3,7 @@
 diesel::table! {
     projects (id) {
         id -> Text,
+        parent_id -> Nullable<Text>,
         slug -> Text,
         name -> Text,
         repo_path -> Nullable<Text>,
@@ -15,6 +16,7 @@ diesel::table! {
     goals (id) {
         id -> Text,
         project_id -> Text,
+        parent_id -> Nullable<Text>,
         slug -> Text,
         title -> Text,
         description -> Text,

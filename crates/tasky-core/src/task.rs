@@ -69,6 +69,17 @@ impl Task {
         })
     }
 
+    /// Replace the body of an open task.
+    ///
+    /// # Errors
+    /// Returns an error if the task is done or cancelled.
+    pub fn set_body(&mut self, body: String, now: Timestamp) -> Result<()> {
+        self.require_open("given a body")?;
+        self.body = body;
+        self.updated_at = now;
+        Ok(())
+    }
+
     /// Replace the test plan of an open task.
     ///
     /// # Errors
@@ -296,6 +307,7 @@ mod tests {
         assert!(task.finish(NOW).is_err());
         assert!(task.set_pr(Some("x".into()), NOW).is_err());
         assert!(task.set_test_plan("x".into(), NOW).is_err());
+        assert!(task.set_body("x".into(), NOW).is_err());
     }
 
     #[test]
@@ -318,8 +330,10 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_and_pr_are_editable_while_open() {
+    fn body_test_plan_and_pr_are_editable_while_open() {
         let mut task = task();
+        task.set_body("Build the thing.".into(), NOW).unwrap();
+        assert_eq!(task.body, "Build the thing.");
         task.set_test_plan("1. run cargo test".into(), NOW).unwrap();
         assert_eq!(task.test_plan, "1. run cargo test");
         task.set_pr(Some("https://example.com/pr/1".into()), NOW)
@@ -329,6 +343,7 @@ mod tests {
         assert_eq!(task.pr, None, "blank clears");
         task.cancel(NOW).unwrap();
         assert!(task.set_pr(Some("x".into()), NOW).is_err());
+        assert!(task.set_body("x".into(), NOW).is_err());
     }
 
     #[test]

@@ -51,6 +51,56 @@ fn setup(p: &Path) {
 }
 
 #[test]
+fn projects_and_goals_nest() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    setup(p);
+    let mobile = ok(
+        p,
+        &["project", "add", "mobile", "Mobile", "--parent", "app"],
+    );
+    assert!(mobile["parent_id"].is_string());
+    ok(p, &["project", "add", "ios", "--parent", "app/mobile"]);
+    fails(p, &["project", "add", "mobile", "--parent", "app"]);
+    fails(p, &["project", "add", "x", "--parent", "nope"]);
+    let shown = ok(p, &["project", "show", "app/mobile/ios"]);
+    assert_eq!(shown["path"], "app/mobile/ios");
+    assert_eq!(ok(p, &["project", "show", "app"])["subprojects"], 1);
+
+    let login = ok(
+        p,
+        &[
+            "goal", "add", "app", "login", "Login", "--parent", "app/auth",
+        ],
+    );
+    assert!(login["parent_id"].is_string());
+    fails(p, &["goal", "add", "app", "x", "X", "--parent", "web/auth"]);
+    ok(p, &["goal", "activate", "app/login"]);
+    let task = id(&ok(p, &["task", "add", "app/login", "Build login"]));
+    assert_eq!(ok(p, &["goal", "show", "app/auth"])["subgoals"], 1);
+    assert_eq!(ok(p, &["goal", "show", "app/auth"])["tasks"]["todo"], 1);
+    assert!(fails(p, &["goal", "complete", "app/auth"]).contains("sub-goal"));
+    for step in ["start", "test", "pass", "done"] {
+        ok(p, &["task", step, &task]);
+    }
+    ok(p, &["goal", "complete", "app/login"]);
+    assert_eq!(
+        ok(p, &["goal", "complete", "app/auth"])["status"],
+        "complete"
+    );
+
+    ok(p, &["goal", "add", "app/mobile", "shell", "App shell"]);
+    assert_eq!(len(&ok(p, &["goal", "list", "--project", "app"])), 3);
+    assert_eq!(len(&ok(p, &["goal", "list", "--project", "app/mobile"])), 1);
+    let shell = id(&ok(p, &["task", "add", "app/mobile/shell", "Scaffold"]));
+    let web = id(&ok(p, &["task", "add", "web/auth", "Web task"]));
+    ok(p, &["task", "depend", &shell, &task]);
+    fails(p, &["task", "depend", &web, &shell]);
+    assert_eq!(len(&ok(p, &["task", "list", "--project", "app"])), 2);
+    assert_eq!(ok(p, &["task", "show", &shell])["project"], "app/mobile");
+}
+
+#[test]
 fn projects_carry_optional_repo_path_and_url() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
@@ -241,12 +291,14 @@ fn tasks_form_a_gated_graph_within_a_project() {
 }
 
 #[test]
-fn test_plan_and_pr_are_fields_on_the_task() {
+fn body_test_plan_and_pr_are_fields_on_the_task() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
     setup(p);
     let plan_file = p.join("plan.md");
     std::fs::write(&plan_file, "1. cargo test\n").unwrap();
+    let body_file = p.join("body.md");
+    std::fs::write(&body_file, "Build it.\n").unwrap();
     let task = ok(
         p,
         &[
@@ -254,13 +306,20 @@ fn test_plan_and_pr_are_fields_on_the_task() {
             "add",
             "app/auth",
             "Work",
+            "--body-file",
+            body_file.to_str().unwrap(),
             "--test-plan-file",
             plan_file.to_str().unwrap(),
         ],
     );
+    assert_eq!(task["body"], "Build it.\n");
     assert_eq!(task["test_plan"], "1. cargo test\n");
     assert_eq!(task["pr"], Value::Null);
     let id = id(&task);
+    assert_eq!(
+        ok(p, &["task", "body", &id, "--text", "Build it well."])["body"],
+        "Build it well."
+    );
     assert_eq!(
         ok(p, &["task", "test-plan", &id, "--text", "2. clippy"])["test_plan"],
         "2. clippy"

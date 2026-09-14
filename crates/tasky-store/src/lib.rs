@@ -86,7 +86,7 @@ pub struct TaskFilter {
 pub struct TaskDetail {
     #[serde(flatten)]
     pub task: Task,
-    /// Project slug.
+    /// Project path, such as `app/mobile`.
     pub project: String,
     /// Goal slug.
     pub goal: String,
@@ -125,21 +125,27 @@ impl TaskCounts {
     }
 }
 
-/// A goal with its project slug and task totals.
+/// A goal with its project path, direct sub-goal count, and task totals over its whole
+/// subtree.
 #[derive(Debug, Clone, Serialize)]
 pub struct GoalDetail {
     #[serde(flatten)]
     pub goal: Goal,
-    /// Project slug.
+    /// Project path, such as `app/mobile`.
     pub project: String,
+    pub subgoals: usize,
     pub tasks: TaskCounts,
 }
 
-/// A project with how many goals it has and its task totals.
+/// A project with its path, direct sub-project and goal counts, and task totals over its
+/// whole subtree.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectDetail {
     #[serde(flatten)]
     pub project: Project,
+    /// Path from the root project, such as `app/mobile`.
+    pub path: String,
+    pub subprojects: usize,
     pub goals: usize,
     pub tasks: TaskCounts,
 }
@@ -174,30 +180,142 @@ fn single<T>(mut rows: Vec<T>, kind: &str, reference: &str) -> Result<T> {
     }
 }
 
-/// Resolve a project by slug, or by a unique prefix or suffix of its ID.
-fn find_project(conn: &mut SqliteConnection, reference: &str) -> Result<Project> {
-    let by_slug = projects::table
-        .filter(projects::slug.eq(reference))
+fn project_by_id(conn: &mut SqliteConnection, id: &str) -> Result<Project> {
+    projects::table
+        .find(id)
         .select(ProjectRow::as_select())
         .first(conn)
-        .optional()?;
-    if let Some(row) = by_slug {
-        return row.try_into();
-    }
-    let (prefix, suffix) = id_patterns(reference)?;
-    let rows = projects::table
-        .filter(projects::id.like(prefix).or(projects::id.like(suffix)))
-        .order(projects::id)
-        .limit(2)
-        .select(ProjectRow::as_select())
-        .load(conn)?;
-    single(rows, "project", reference)?.try_into()
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("project {id}")))?
+        .try_into()
 }
 
-/// Resolve a goal reference: `project/slug`, a slug that is unique across projects, or a
-/// unique prefix or suffix of its ID.
+/// The child of `parent` (or a root when `None`) with this slug, if any.
+fn child_project(
+    conn: &mut SqliteConnection,
+    parent: Option<&str>,
+    slug: &str,
+) -> Result<Option<Project>> {
+    let mut query = projects::table.filter(projects::slug.eq(slug)).into_boxed();
+    query = match parent {
+        Some(parent) => query.filter(projects::parent_id.eq(parent.to_owned())),
+        None => query.filter(projects::parent_id.is_null()),
+    };
+    query
+        .select(ProjectRow::as_select())
+        .first(conn)
+        .optional()?
+        .map(Project::try_from)
+        .transpose()
+}
+
+/// Resolve a project by path (`app` or `app/mobile/ios`), or by a unique prefix or suffix
+/// of its ID when the reference has no slash.
+fn find_project(conn: &mut SqliteConnection, reference: &str) -> Result<Project> {
+    let mut segments = reference.split('/');
+    let first = segments.next().unwrap_or_default();
+    let mut current = child_project(conn, None, first)?;
+    if current.is_none() && !reference.contains('/') {
+        let (prefix, suffix) = id_patterns(reference)?;
+        let rows = projects::table
+            .filter(projects::id.like(prefix).or(projects::id.like(suffix)))
+            .order(projects::id)
+            .limit(2)
+            .select(ProjectRow::as_select())
+            .load(conn)?;
+        return single(rows, "project", reference)?.try_into();
+    }
+    for segment in segments {
+        let Some(parent) = current else {
+            break;
+        };
+        current = child_project(conn, Some(&parent.id), segment)?;
+    }
+    current.ok_or_else(|| Error::NotFound(format!("project {reference}")).into())
+}
+
+/// Slugs from the root down to this project, joined with `/`.
+fn project_path(conn: &mut SqliteConnection, project: &Project) -> Result<String> {
+    let mut segments = vec![project.slug.clone()];
+    let mut parent = project.parent_id.clone();
+    let mut hops = 0;
+    while let Some(id) = parent {
+        let ancestor = project_by_id(conn, &id)?;
+        segments.push(ancestor.slug);
+        parent = ancestor.parent_id;
+        hops += 1;
+        ensure!(hops < 1000, "project parent chain is cyclic");
+    }
+    segments.reverse();
+    Ok(segments.join("/"))
+}
+
+/// The top-most ancestor of a project. Dependencies may join tasks anywhere under one root.
+fn root_project_id(conn: &mut SqliteConnection, project_id: &str) -> Result<String> {
+    let mut project = project_by_id(conn, project_id)?;
+    let mut hops = 0;
+    while let Some(parent) = project.parent_id.clone() {
+        project = project_by_id(conn, &parent)?;
+        hops += 1;
+        ensure!(hops < 1000, "project parent chain is cyclic");
+    }
+    Ok(project.id)
+}
+
+/// Every project, in creation order.
+fn load_projects(conn: &mut SqliteConnection) -> Result<Vec<Project>> {
+    projects::table
+        .order(projects::id)
+        .select(ProjectRow::as_select())
+        .load(conn)?
+        .into_iter()
+        .map(Project::try_from)
+        .collect()
+}
+
+/// IDs of `root` and every project beneath it, breadth first.
+fn project_subtree(conn: &mut SqliteConnection, root: &str) -> Result<Vec<String>> {
+    let projects = load_projects(conn)?;
+    Ok(subtree(
+        root,
+        projects
+            .iter()
+            .map(|p| (p.id.as_str(), p.parent_id.as_deref())),
+    ))
+}
+
+/// IDs of `root` and every goal beneath it, breadth first.
+fn goal_subtree(conn: &mut SqliteConnection, root: &str) -> Result<Vec<String>> {
+    let goals = load_goals(conn, None)?;
+    Ok(subtree(
+        root,
+        goals
+            .iter()
+            .map(|g| (g.id.as_str(), g.parent_id.as_deref())),
+    ))
+}
+
+/// Breadth-first walk over (id, parent) pairs starting at `root`.
+fn subtree<'a>(root: &str, edges: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> Vec<String> {
+    let edges: Vec<(&str, Option<&str>)> = edges.collect();
+    let mut found = vec![root.to_owned()];
+    let mut index = 0;
+    while index < found.len() {
+        let parent = found[index].clone();
+        for (id, parent_id) in &edges {
+            if *parent_id == Some(parent.as_str()) && !found.iter().any(|f| f == id) {
+                found.push((*id).to_owned());
+            }
+        }
+        index += 1;
+    }
+    found
+}
+
+/// Resolve a goal reference: `PROJECT/slug` where the project part is a project path, a slug
+/// that is unique across every project, or a unique prefix or suffix of its ID.
 fn find_goal(conn: &mut SqliteConnection, reference: &str) -> Result<Goal> {
-    if let Some((project, slug)) = reference.split_once('/') {
+    if let Some((project, slug)) = reference.rsplit_once('/') {
         let project = find_project(conn, project)?;
         return goals::table
             .filter(goals::project_id.eq(&project.id))
@@ -244,13 +362,6 @@ fn goal_by_id(conn: &mut SqliteConnection, id: &str) -> Result<Goal> {
         .try_into()
 }
 
-fn project_slug(conn: &mut SqliteConnection, project_id: &str) -> Result<String> {
-    Ok(projects::table
-        .find(project_id)
-        .select(projects::slug)
-        .first(conn)?)
-}
-
 fn find_task(conn: &mut SqliteConnection, reference: &str) -> Result<Task> {
     let (prefix, suffix) = id_patterns(reference)?;
     let rows = tasks::table
@@ -272,6 +383,42 @@ fn load_goals(conn: &mut SqliteConnection, project_id: Option<&str>) -> Result<V
         .load(conn)?
         .into_iter()
         .map(Goal::try_from)
+        .collect()
+}
+
+/// Goals of every project in `project_ids`, in creation order.
+fn goals_in_projects(conn: &mut SqliteConnection, project_ids: &[String]) -> Result<Vec<Goal>> {
+    goals::table
+        .filter(goals::project_id.eq_any(project_ids))
+        .order(goals::id)
+        .select(GoalRow::as_select())
+        .load(conn)?
+        .into_iter()
+        .map(Goal::try_from)
+        .collect()
+}
+
+/// Direct sub-goals of a goal, in creation order.
+fn load_subgoals(conn: &mut SqliteConnection, goal_id: &str) -> Result<Vec<Goal>> {
+    goals::table
+        .filter(goals::parent_id.eq(goal_id))
+        .order(goals::id)
+        .select(GoalRow::as_select())
+        .load(conn)?
+        .into_iter()
+        .map(Goal::try_from)
+        .collect()
+}
+
+/// Tasks of every goal in `goal_ids`, in creation order.
+fn tasks_in_goals(conn: &mut SqliteConnection, goal_ids: &[String]) -> Result<Vec<Task>> {
+    tasks::table
+        .filter(tasks::goal_id.eq_any(goal_ids))
+        .order(tasks::id)
+        .select(TaskRow::as_select())
+        .load(conn)?
+        .into_iter()
+        .map(Task::try_from)
         .collect()
 }
 
@@ -298,8 +445,8 @@ fn load_dependencies(conn: &mut SqliteConnection) -> Result<Vec<Dependency>> {
         .collect()
 }
 
-/// Every task and edge in the database. Edges never cross projects, so the union of all
-/// projects is still a DAG and callers build one [`Dag`] from the pair.
+/// Every task and edge in the database. Edges never cross root projects, so the union of
+/// all projects is still a DAG and callers build one [`Dag`] from the pair.
 fn load_graph(conn: &mut SqliteConnection) -> Result<(Vec<Task>, Vec<Dependency>)> {
     Ok((load_tasks(conn, None)?, load_dependencies(conn)?))
 }
@@ -329,7 +476,8 @@ fn save_task(conn: &mut SqliteConnection, task: &Task) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a scope to the goal IDs whose tasks it keeps; `None` keeps everything.
+/// Resolve a scope to the goal IDs whose tasks it keeps; `None` keeps everything. A project
+/// covers every project beneath it and a goal covers every sub-goal beneath it.
 fn scope_goals(conn: &mut SqliteConnection, scope: &TaskScope) -> Result<Option<BTreeSet<String>>> {
     let project = scope
         .project
@@ -339,18 +487,20 @@ fn scope_goals(conn: &mut SqliteConnection, scope: &TaskScope) -> Result<Option<
     if let Some(reference) = scope.goal.as_deref() {
         let goal = find_goal(conn, reference)?;
         if let Some(project) = &project {
+            let within = project_subtree(conn, &project.id)?;
             ensure!(
-                goal.project_id == project.id,
+                within.contains(&goal.project_id),
                 Error::NotFound(format!("goal {reference} in project {}", project.slug))
             );
         }
-        return Ok(Some(BTreeSet::from([goal.id])));
+        return Ok(Some(goal_subtree(conn, &goal.id)?.into_iter().collect()));
     }
     let Some(project) = project else {
         return Ok(None);
     };
+    let projects = project_subtree(conn, &project.id)?;
     Ok(Some(
-        load_goals(conn, Some(&project.id))?
+        goals_in_projects(conn, &projects)?
             .into_iter()
             .map(|goal| goal.id)
             .collect(),
@@ -430,27 +580,34 @@ impl Store {
         Ok(applied.iter().map(ToString::to_string).collect())
     }
 
-    /// Create a project, optionally tied to a repository by local path and/or remote URL.
+    /// Create a project, optionally inside a parent project and optionally tied to a
+    /// repository by local path and/or remote URL.
     ///
     /// # Errors
-    /// Returns an error if the slug is malformed or taken, or the name is blank.
+    /// Returns an error if the parent cannot be resolved, the slug is malformed or already
+    /// used by a sibling, or the name is blank.
     pub fn create_project(
         &mut self,
+        parent: Option<&str>,
         slug: String,
         name: String,
         repo_path: Option<String>,
         repo_url: Option<String>,
     ) -> Result<Project> {
-        let project = Project::new(new_id(), slug, name, repo_path, repo_url, now())?;
         self.conn.immediate_transaction(|conn| {
-            let taken: i64 = projects::table
-                .filter(projects::slug.eq(&project.slug))
-                .count()
-                .get_result(conn)?;
-            ensure!(
-                taken == 0,
-                Error::Duplicate(format!("project {}", project.slug))
-            );
+            let parent = parent
+                .map(|reference| find_project(conn, reference))
+                .transpose()?;
+            let parent_id = parent.as_ref().map(|parent| parent.id.clone());
+            let project =
+                Project::new(new_id(), parent_id, slug, name, repo_path, repo_url, now())?;
+            if child_project(conn, project.parent_id.as_deref(), &project.slug)?.is_some() {
+                let path = match &parent {
+                    Some(parent) => format!("{}/{}", project_path(conn, parent)?, project.slug),
+                    None => project.slug.clone(),
+                };
+                return Err(Error::Duplicate(format!("project {path}")).into());
+            }
             diesel::insert_into(projects::table)
                 .values(ProjectRow::from(&project))
                 .execute(conn)?;
@@ -458,21 +615,16 @@ impl Store {
         })
     }
 
-    /// Every project in creation order.
+    /// Every project in creation order, roots and nested alike.
     ///
     /// # Errors
     /// Returns an error if a row cannot be read.
     pub fn projects(&mut self) -> Result<Vec<Project>> {
-        projects::table
-            .order(projects::id)
-            .select(ProjectRow::as_select())
-            .load(&mut self.conn)?
-            .into_iter()
-            .map(Project::try_from)
-            .collect()
+        load_projects(&mut self.conn)
     }
 
-    /// Look up a project by slug, or by a unique prefix or suffix of its ID.
+    /// Look up a project by path such as `app/mobile`, or by a unique prefix or suffix of
+    /// its ID.
     ///
     /// # Errors
     /// Returns an error if nothing or more than one project matches.
@@ -501,34 +653,46 @@ impl Store {
         })
     }
 
-    /// A project with its goal count and task totals.
+    /// A project with its path, direct sub-project and goal counts, and task totals over
+    /// everything beneath it.
     ///
     /// # Errors
     /// Returns an error if the project cannot be resolved.
     pub fn project_detail(&mut self, reference: &str) -> Result<ProjectDetail> {
         let conn = &mut self.conn;
         let project = find_project(conn, reference)?;
-        let goals = load_goals(conn, Some(&project.id))?;
-        let goal_ids: BTreeSet<&str> = goals.iter().map(|f| f.id.as_str()).collect();
-        let tasks: Vec<Task> = load_tasks(conn, None)?
+        let path = project_path(conn, &project)?;
+        let subtree = project_subtree(conn, &project.id)?;
+        let subprojects = load_projects(conn)?
+            .iter()
+            .filter(|p| p.parent_id.as_deref() == Some(project.id.as_str()))
+            .count();
+        let goals = load_goals(conn, Some(&project.id))?.len();
+        let goal_ids: Vec<String> = goals_in_projects(conn, &subtree)?
             .into_iter()
-            .filter(|task| goal_ids.contains(task.goal_id.as_str()))
+            .map(|goal| goal.id)
             .collect();
+        let tasks = tasks_in_goals(conn, &goal_ids)?;
         Ok(ProjectDetail {
             project,
-            goals: goals.len(),
+            path,
+            subprojects,
+            goals,
             tasks: TaskCounts::of(&tasks),
         })
     }
 
-    /// Create a draft goal in a project, optionally with a spec.
+    /// Create a draft goal in a project, optionally inside a parent goal of that project and
+    /// optionally with a spec.
     ///
     /// # Errors
-    /// Returns an error if the project cannot be resolved, the slug is malformed or taken
-    /// within the project, or the title is blank.
+    /// Returns an error if the project or parent cannot be resolved, the parent is in another
+    /// project or already closed, the slug is malformed or taken within the project, or the
+    /// title is blank.
     pub fn create_goal(
         &mut self,
         project: &str,
+        parent: Option<&str>,
         slug: String,
         title: String,
         description: String,
@@ -536,9 +700,23 @@ impl Store {
     ) -> Result<Goal> {
         self.conn.immediate_transaction(|conn| {
             let project = find_project(conn, project)?;
+            let parent = parent
+                .map(|reference| find_goal(conn, reference))
+                .transpose()?;
+            if let Some(parent) = &parent {
+                ensure!(
+                    parent.project_id == project.id,
+                    Error::Invalid(format!(
+                        "parent goal {} belongs to a different project",
+                        parent.slug
+                    ))
+                );
+                parent.require_open()?;
+            }
             let goal = Goal::new(
                 new_id(),
                 project.id.clone(),
+                parent.map(|parent| parent.id),
                 slug,
                 title,
                 description,
@@ -561,19 +739,21 @@ impl Store {
         })
     }
 
-    /// Goals in creation order, optionally within one project.
+    /// Goals in creation order, optionally within one project and the projects beneath it.
     ///
     /// # Errors
     /// Returns an error if the project cannot be resolved or a row cannot be read.
     pub fn goals(&mut self, project: Option<&str>) -> Result<Vec<Goal>> {
         let conn = &mut self.conn;
-        let project = project
-            .map(|reference| find_project(conn, reference))
-            .transpose()?;
-        load_goals(conn, project.as_ref().map(|project| project.id.as_str()))
+        let Some(reference) = project else {
+            return load_goals(conn, None);
+        };
+        let project = find_project(conn, reference)?;
+        let subtree = project_subtree(conn, &project.id)?;
+        goals_in_projects(conn, &subtree)
     }
 
-    /// Look up a goal by `project/slug`, by a slug unique across projects, or by a unique
+    /// Look up a goal by `PROJECT/slug`, by a slug unique across projects, or by a unique
     /// prefix or suffix of its ID.
     ///
     /// # Errors
@@ -582,18 +762,23 @@ impl Store {
         find_goal(&mut self.conn, reference)
     }
 
-    /// A goal with its project slug and task totals.
+    /// A goal with its project path, direct sub-goal count, and task totals over everything
+    /// beneath it.
     ///
     /// # Errors
     /// Returns an error if the goal cannot be resolved.
     pub fn goal_detail(&mut self, reference: &str) -> Result<GoalDetail> {
         let conn = &mut self.conn;
         let goal = find_goal(conn, reference)?;
-        let project = project_slug(conn, &goal.project_id)?;
-        let tasks = load_tasks(conn, Some(&goal.id))?;
+        let project = project_by_id(conn, &goal.project_id)?;
+        let project = project_path(conn, &project)?;
+        let subgoals = load_subgoals(conn, &goal.id)?.len();
+        let subtree = goal_subtree(conn, &goal.id)?;
+        let tasks = tasks_in_goals(conn, &subtree)?;
         Ok(GoalDetail {
             goal,
             project,
+            subgoals,
             tasks: TaskCounts::of(&tasks),
         })
     }
@@ -627,23 +812,28 @@ impl Store {
         self.update_goal(reference, |goal, _| Ok(goal.activate(now())?))
     }
 
-    /// Complete an active goal whose tasks are all finished.
+    /// Complete an active goal whose own tasks are all finished and whose sub-goals are all
+    /// closed.
     ///
     /// # Errors
     /// Returns an error if the goal cannot be resolved or the transition is invalid.
     pub fn complete_goal(&mut self, reference: &str) -> Result<Goal> {
         self.update_goal(reference, |goal, conn| {
             let tasks = load_tasks(conn, Some(&goal.id))?;
-            Ok(goal.complete(&tasks, now())?)
+            let subgoals = load_subgoals(conn, &goal.id)?;
+            Ok(goal.complete(&tasks, &subgoals, now())?)
         })
     }
 
-    /// Cancel a draft or active goal.
+    /// Cancel a draft or active goal whose sub-goals are all closed.
     ///
     /// # Errors
     /// Returns an error if the goal cannot be resolved or the transition is invalid.
     pub fn cancel_goal(&mut self, reference: &str) -> Result<Goal> {
-        self.update_goal(reference, |goal, _| Ok(goal.cancel(now())?))
+        self.update_goal(reference, |goal, conn| {
+            let subgoals = load_subgoals(conn, &goal.id)?;
+            Ok(goal.cancel(&subgoals, now())?)
+        })
     }
 
     /// Add a todo task to a goal.
@@ -697,11 +887,10 @@ impl Store {
     pub fn task_detail(&mut self, reference: &str) -> Result<TaskDetail> {
         let conn = &mut self.conn;
         let task = find_task(conn, reference)?;
-        let (goal, project) = goals::table
-            .inner_join(projects::table)
-            .filter(goals::id.eq(&task.goal_id))
-            .select((goals::slug, projects::slug))
-            .first::<(String, String)>(conn)?;
+        let owner = goal_by_id(conn, &task.goal_id)?;
+        let goal = owner.slug.clone();
+        let owner_project = project_by_id(conn, &owner.project_id)?;
+        let project = project_path(conn, &owner_project)?;
         let links = load_links(conn, &task.id)?;
         let (all_tasks, edges) = load_graph(conn)?;
         let dag = Dag::new(&all_tasks, &edges)?;
@@ -738,6 +927,14 @@ impl Store {
             save_task(conn, &task)?;
             Ok(task)
         })
+    }
+
+    /// Replace the body of an open task.
+    ///
+    /// # Errors
+    /// Returns an error if the task cannot be resolved or is closed.
+    pub fn set_body(&mut self, reference: &str, body: String) -> Result<Task> {
+        self.update_task(reference, |task, _| Ok(task.set_body(body, now())?))
     }
 
     /// Replace the test plan of an open task.
@@ -810,7 +1007,7 @@ impl Store {
     ///
     /// # Errors
     /// Returns an error if either task cannot be resolved, the tasks belong to different
-    /// projects, the task has started, or the edge would create a cycle.
+    /// root projects, the task has started, or the edge would create a cycle.
     pub fn add_dependency(&mut self, task: &str, depends_on: &str) -> Result<Dependency> {
         self.conn.immediate_transaction(|conn| {
             let task = find_task(conn, task)?;
@@ -818,7 +1015,8 @@ impl Store {
             let task_project = goal_by_id(conn, &task.goal_id)?.project_id;
             let dependency_project = goal_by_id(conn, &depends_on.goal_id)?.project_id;
             ensure!(
-                task_project == dependency_project,
+                root_project_id(conn, &task_project)?
+                    == root_project_id(conn, &dependency_project)?,
                 Error::Invalid(format!(
                     "task {} cannot depend on {}: they belong to different projects",
                     task.id, depends_on.id
@@ -919,7 +1117,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::init(&dir.path().join("tasky.db")).unwrap();
         store
-            .create_project("app".into(), "App".into(), None, None)
+            .create_project(None, "app".into(), "App".into(), None, None)
             .unwrap();
         (dir, store)
     }
@@ -932,6 +1130,7 @@ mod tests {
         store
             .create_goal(
                 project,
+                None,
                 slug.into(),
                 slug.to_uppercase(),
                 String::new(),
@@ -1001,6 +1200,7 @@ mod tests {
         let (_dir, mut store) = store();
         let web = store
             .create_project(
+                None,
                 "web".into(),
                 "Web".into(),
                 None,
@@ -1011,17 +1211,17 @@ mod tests {
         assert_eq!(web.repo_url.as_deref(), Some("https://example.com/web.git"));
         assert!(
             store
-                .create_project("web".into(), "Again".into(), None, None)
+                .create_project(None, "web".into(), "Again".into(), None, None)
                 .is_err()
         );
         assert!(
             store
-                .create_project("Web".into(), "Bad".into(), None, None)
+                .create_project(None, "Web".into(), "Bad".into(), None, None)
                 .is_err()
         );
         assert!(
             store
-                .create_project("cli".into(), " ".into(), None, None)
+                .create_project(None, "cli".into(), " ".into(), None, None)
                 .is_err()
         );
         assert_eq!(store.projects().unwrap().len(), 2);
@@ -1061,18 +1261,25 @@ mod tests {
     fn goal_slugs_are_scoped_to_projects() {
         let (_dir, mut store) = store();
         store
-            .create_project("web".into(), "Web".into(), None, None)
+            .create_project(None, "web".into(), "Web".into(), None, None)
             .unwrap();
         let app_auth = goal(&mut store, "app", "auth");
         assert!(
             store
-                .create_goal("app", "auth".into(), "Again".into(), String::new(), None)
+                .create_goal(
+                    "app",
+                    None,
+                    "auth".into(),
+                    "Again".into(),
+                    String::new(),
+                    None
+                )
                 .is_err(),
             "duplicate within project"
         );
         assert!(
             store
-                .create_goal("nope", "x".into(), "X".into(), String::new(), None)
+                .create_goal("nope", None, "x".into(), "X".into(), String::new(), None)
                 .is_err()
         );
         let web_auth = goal(&mut store, "web", "auth");
@@ -1109,6 +1316,7 @@ mod tests {
         let created = store
             .create_goal(
                 "app",
+                None,
                 "auth".into(),
                 "Auth".into(),
                 "Log in".into(),
@@ -1256,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_and_pr_live_on_the_task() {
+    fn body_test_plan_and_pr_live_on_the_task() {
         let (_dir, mut store) = store();
         goal(&mut store, "app", "f");
         let task = store
@@ -1264,6 +1472,8 @@ mod tests {
             .unwrap();
         assert_eq!(task.test_plan, "cargo test");
         assert_eq!(task.pr, None);
+        let with_body = store.set_body(&task.id, "Build it.".into()).unwrap();
+        assert_eq!(with_body.body, "Build it.");
         let updated = store
             .set_test_plan(&task.id, "1. cargo test".into())
             .unwrap();
@@ -1278,6 +1488,8 @@ mod tests {
         assert_eq!(done.pr.as_deref(), Some("https://example.com/pr/7"));
         assert!(store.set_pr(&task.id, None).is_err(), "done is frozen");
         assert!(store.set_test_plan(&task.id, "x".into()).is_err());
+        assert!(store.set_body(&task.id, "x".into()).is_err());
+        assert_eq!(done.body, "Build it.");
         assert_eq!(store.goal_detail("f").unwrap().tasks.done, 1);
     }
 
@@ -1285,7 +1497,7 @@ mod tests {
     fn projects_are_isolated() {
         let (_dir, mut store) = store();
         store
-            .create_project("web".into(), "Web".into(), None, None)
+            .create_project(None, "web".into(), "Web".into(), None, None)
             .unwrap();
         goal(&mut store, "app", "core");
         goal(&mut store, "web", "site");
@@ -1321,5 +1533,184 @@ mod tests {
         });
         assert_eq!(results.iter().filter(|ok| **ok).count(), 1);
         assert_eq!(store.task(&task.id).unwrap().status, TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn projects_nest_by_path_and_slugs_are_unique_among_siblings() {
+        let (_dir, mut store) = store();
+        let mobile = store
+            .create_project(Some("app"), "mobile".into(), "Mobile".into(), None, None)
+            .unwrap();
+        let ios = store
+            .create_project(Some("app/mobile"), "ios".into(), "iOS".into(), None, None)
+            .unwrap();
+        assert_eq!(
+            mobile.parent_id.as_deref(),
+            Some(store.project("app").unwrap().id.as_str())
+        );
+        assert_eq!(store.project("app/mobile/ios").unwrap().id, ios.id);
+        assert!(store.project("app/ios").is_err(), "paths must be exact");
+        assert!(store.project("mobile").is_err(), "a child is not a root");
+        assert!(
+            store
+                .create_project(Some("app"), "mobile".into(), "Again".into(), None, None)
+                .is_err(),
+            "duplicate among siblings"
+        );
+        store
+            .create_project(None, "mobile".into(), "Root mobile".into(), None, None)
+            .unwrap();
+        assert!(
+            store
+                .create_project(None, "mobile".into(), "Again".into(), None, None)
+                .is_err(),
+            "duplicate root"
+        );
+        assert!(
+            store
+                .create_project(Some("nope"), "x".into(), "X".into(), None, None)
+                .is_err()
+        );
+        let detail = store.project_detail("app").unwrap();
+        assert_eq!(detail.path, "app");
+        assert_eq!(detail.subprojects, 1);
+        assert_eq!(
+            store.project_detail("app/mobile/ios").unwrap().path,
+            "app/mobile/ios"
+        );
+        assert_eq!(store.projects().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn subgoals_stay_in_their_project_and_gate_closing() {
+        let (_dir, mut store) = store();
+        store
+            .create_project(None, "web".into(), "Web".into(), None, None)
+            .unwrap();
+        goal(&mut store, "app", "auth");
+        goal(&mut store, "web", "site");
+        let login = store
+            .create_goal(
+                "app",
+                Some("app/auth"),
+                "login".into(),
+                "Login".into(),
+                String::new(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(login.parent_id, Some(store.goal("app/auth").unwrap().id));
+        assert!(
+            store
+                .create_goal(
+                    "app",
+                    Some("web/site"),
+                    "x".into(),
+                    "X".into(),
+                    String::new(),
+                    None
+                )
+                .is_err(),
+            "parent in another project"
+        );
+        assert!(
+            store
+                .create_goal(
+                    "app",
+                    Some("app/auth"),
+                    "auth".into(),
+                    "Dup".into(),
+                    String::new(),
+                    None
+                )
+                .is_err(),
+            "slugs stay unique per project at any depth"
+        );
+        let work = task(&mut store, "app/login", "Build login");
+        store.activate_goal("app/auth").unwrap();
+        store.activate_goal("app/login").unwrap();
+        assert_eq!(store.goal_detail("app/auth").unwrap().subgoals, 1);
+        assert_eq!(
+            store.goal_detail("app/auth").unwrap().tasks.todo,
+            1,
+            "subtree counts"
+        );
+        assert!(
+            store.complete_goal("app/auth").is_err(),
+            "sub-goal still open"
+        );
+        assert!(store.cancel_goal("app/auth").is_err(), "cancel waits too");
+        assert!(
+            store.complete_goal("app/login").is_err(),
+            "its task is open"
+        );
+        finish(&mut store, &work.id);
+        store.complete_goal("app/login").unwrap();
+        assert_eq!(
+            store.complete_goal("app/auth").unwrap().status,
+            GoalStatus::Complete
+        );
+        assert!(
+            store
+                .create_goal(
+                    "app",
+                    Some("app/auth"),
+                    "late".into(),
+                    "Late".into(),
+                    String::new(),
+                    None
+                )
+                .is_err(),
+            "closed goals take no new sub-goals"
+        );
+        assert_eq!(store.goals(Some("app")).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn scopes_and_dependencies_follow_the_project_tree() {
+        let (_dir, mut store) = store();
+        store
+            .create_project(Some("app"), "mobile".into(), "Mobile".into(), None, None)
+            .unwrap();
+        store
+            .create_project(None, "other".into(), "Other".into(), None, None)
+            .unwrap();
+        goal(&mut store, "app", "core");
+        goal(&mut store, "app/mobile", "ui");
+        goal(&mut store, "other", "misc");
+        let core = task(&mut store, "app/core", "Core");
+        let ui = task(&mut store, "app/mobile/ui", "UI");
+        let misc = task(&mut store, "other/misc", "Misc");
+        store.add_dependency(&ui.id, &core.id).unwrap();
+        assert!(
+            store.add_dependency(&misc.id, &core.id).is_err(),
+            "different root projects"
+        );
+        assert_eq!(
+            store.goals(Some("app")).unwrap().len(),
+            2,
+            "goals of sub-projects too"
+        );
+        assert_eq!(store.goals(Some("app/mobile")).unwrap().len(), 1);
+        assert_eq!(
+            store.task_order(&scope(Some("app"), None)).unwrap().len(),
+            2,
+            "project scope covers sub-projects"
+        );
+        assert_eq!(
+            store
+                .task_order(&scope(Some("app/mobile"), None))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .ready_tasks(&scope(Some("app/mobile"), Some("app/core")))
+                .is_err(),
+            "goal outside the project subtree"
+        );
+        assert_eq!(store.project_detail("app").unwrap().tasks.todo, 2);
+        assert_eq!(store.task_detail(&ui.id).unwrap().project, "app/mobile");
     }
 }

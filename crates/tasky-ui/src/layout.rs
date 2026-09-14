@@ -1,9 +1,10 @@
 //! Pure layout of projects, goals, and tasks as one left-to-right graph in world units.
 //!
-//! Nothing here touches GPUI, so it is unit-tested without a display. Column 0 holds
-//! projects, column 1 their goals, and the columns after that hold tasks by dependency rank,
-//! so every edge, hierarchy or dependency, flows left to right. Circles are large because a
-//! node's title lives inside it and appears as the viewer zooms in.
+//! Nothing here touches GPUI, so it is unit-tested without a display. A root project sits
+//! in column 0; its goals one column right; a goal's tasks further right by dependency rank.
+//! Sub-projects and sub-goals indent one column to the right beneath their parent, at any
+//! depth, so every hierarchy edge flows left to right. Shapes are large because a node's
+//! title lives inside it and appears as the viewer zooms in.
 //!
 //! A goal is joined only to its tasks that have no prerequisite inside the same goal; every
 //! other task is already reached from the goal through dependency edges, so drawing the
@@ -22,8 +23,12 @@ pub(crate) const GOAL_HW: f32 = 120.0;
 pub(crate) const GOAL_HH: f32 = 70.0;
 pub(crate) const TASK_R: f32 = 64.0;
 const COL_GAP: f32 = 130.0;
-const COL_GOAL: f32 = PROJECT_HW + COL_GAP + GOAL_HW;
-const COL_TASK: f32 = COL_GOAL + GOAL_HW + COL_GAP + TASK_R;
+/// Horizontal offset from a project's centre to its goals' centre, and to a sub-project's.
+const GOAL_OFFSET: f32 = PROJECT_HW + COL_GAP + GOAL_HW;
+const SUBPROJECT_OFFSET: f32 = 2.0 * PROJECT_HW + COL_GAP;
+/// Horizontal offset from a goal's centre to its first task column, and to a sub-goal's.
+const TASK_OFFSET: f32 = GOAL_HW + COL_GAP + TASK_R;
+const SUBGOAL_OFFSET: f32 = 2.0 * GOAL_HW + COL_GAP;
 const COL_STEP: f32 = 2.0 * TASK_R + COL_GAP;
 const ROW: f32 = 2.0 * TASK_R + 40.0;
 const GOAL_GAP: f32 = 48.0;
@@ -136,7 +141,8 @@ pub(crate) struct Input<'a> {
     pub collapsed: &'a HashSet<String>,
 }
 
-/// What starts collapsed: complete goals, and projects whose goals are all complete.
+/// What starts collapsed: complete goals, and projects whose goals are all complete and
+/// whose sub-projects would all start collapsed themselves.
 pub(crate) fn default_collapsed(projects: &[Project], goals: &[Goal]) -> HashSet<String> {
     let mut collapsed: HashSet<String> = goals
         .iter()
@@ -144,13 +150,29 @@ pub(crate) fn default_collapsed(projects: &[Project], goals: &[Goal]) -> HashSet
         .map(|goal| goal.id.clone())
         .collect();
     for project in projects {
-        let mut own = goals.iter().filter(|goal| goal.project_id == project.id);
-        let has_goals = goals.iter().any(|goal| goal.project_id == project.id);
-        if has_goals && own.all(|goal| goal.status == GoalStatus::Complete) {
+        if project_finished(project, projects, goals) {
             collapsed.insert(project.id.clone());
         }
     }
     collapsed
+}
+
+/// A project with something beneath it, all of it complete: its own goals and, recursively,
+/// its sub-projects.
+fn project_finished(project: &Project, projects: &[Project], goals: &[Goal]) -> bool {
+    let own: Vec<&Goal> = goals
+        .iter()
+        .filter(|goal| goal.project_id == project.id)
+        .collect();
+    let children: Vec<&Project> = projects
+        .iter()
+        .filter(|p| p.parent_id.as_deref() == Some(project.id.as_str()))
+        .collect();
+    (!own.is_empty() || !children.is_empty())
+        && own.iter().all(|goal| goal.status == GoalStatus::Complete)
+        && children
+            .iter()
+            .all(|child| project_finished(child, projects, goals))
 }
 
 fn count(n: usize) -> f32 {
@@ -202,22 +224,9 @@ impl<'a> Builder<'a> {
         self.out.nodes.len() - 1
     }
 
-    /// Place one goal and, unless collapsed, its tasks in a band starting at `top`;
-    /// returns the band height.
-    fn goal_band(&mut self, goal: &'a Goal, top: f32) -> f32 {
-        let state = goal.status.into();
-        if self.input.collapsed.contains(&goal.id) {
-            let height = 2.0 * GOAL_HH;
-            self.push(
-                &goal.id,
-                Kind::Goal,
-                state,
-                COL_GOAL,
-                top + GOAL_HH,
-                &goal.title,
-            );
-            return height;
-        }
+    /// Place a goal's direct tasks in rows by dependency rank, starting at `top`, with the
+    /// goal centred at `x`; returns the rows' height (zero when the goal has no tasks).
+    fn task_rows(&mut self, goal: &'a Goal, goal_node: usize, x: f32, top: f32) -> f32 {
         let mut rows_in_column: BTreeMap<usize, usize> = BTreeMap::new();
         let mut placed = Vec::new();
         for task in self
@@ -231,25 +240,16 @@ impl<'a> Builder<'a> {
             placed.push((task, column, *row));
             *row += 1;
         }
-        let rows = rows_in_column.values().copied().max().unwrap_or(1).max(1);
-        let height = (count(rows) * ROW).max(2.0 * GOAL_HH);
-        let goal_node = self.push(
-            &goal.id,
-            Kind::Goal,
-            state,
-            COL_GOAL,
-            top + height / 2.0,
-            &goal.title,
-        );
+        let rows = rows_in_column.values().copied().max().unwrap_or(0);
         for (task, column, row) in placed {
-            let x = COL_TASK + count(column) * COL_STEP;
-            let y = top + count(row) * ROW + ROW / 2.0;
+            let tx = x + TASK_OFFSET + count(column) * COL_STEP;
+            let ty = top + count(row) * ROW + ROW / 2.0;
             let node = self.push(
                 &task.task.id,
                 Kind::Task,
                 State::of_task(task),
-                x,
-                y,
+                tx,
+                ty,
                 &task.task.title,
             );
             self.task_index.insert(&task.task.id, node);
@@ -265,47 +265,100 @@ impl<'a> Builder<'a> {
                 });
             }
         }
+        count(rows) * ROW
+    }
+
+    /// Place a goal centred at `x`, and unless collapsed its tasks and then its sub-goals
+    /// one column to the right, starting at `top`; returns the height used.
+    fn goal_block(&mut self, goal: &'a Goal, x: f32, top: f32) -> f32 {
+        let node = self.push(
+            &goal.id,
+            Kind::Goal,
+            goal.status.into(),
+            x,
+            0.0,
+            &goal.title,
+        );
+        let mut y = top;
+        if !self.input.collapsed.contains(&goal.id) {
+            y += self.task_rows(goal, node, x, y);
+            let subgoals: Vec<&'a Goal> = self
+                .input
+                .goals
+                .iter()
+                .filter(|g| g.parent_id.as_deref() == Some(goal.id.as_str()))
+                .collect();
+            for sub in subgoals {
+                if y > top {
+                    y += GOAL_GAP;
+                }
+                let child = self.out.nodes.len();
+                y += self.goal_block(sub, x + SUBGOAL_OFFSET, y);
+                self.out.edges.push(Edge {
+                    from: node,
+                    to: child,
+                    dependency: false,
+                });
+            }
+        }
+        let height = (y - top).max(2.0 * GOAL_HH);
+        self.out.nodes[node].y = top + height / 2.0;
         height
     }
 
-    /// Place one project and, unless collapsed, its goals starting at `top`; returns the
-    /// height used.
-    fn project(&mut self, project: &'a Project, top: f32) -> f32 {
-        let project_node = self.push(
+    /// Place a project centred at `x`, and unless collapsed its goals and then its
+    /// sub-projects one column to the right, starting at `top`; returns the height used.
+    fn project_block(&mut self, project: &'a Project, x: f32, top: f32) -> f32 {
+        let node = self.push(
             &project.id,
             Kind::Project,
             State::Open,
-            0.0,
+            x,
             0.0,
             &project.name,
         );
-        let goals: Vec<&Goal> = if self.input.collapsed.contains(&project.id) {
-            Vec::new()
-        } else {
-            self.input
+        let mut y = top;
+        if !self.input.collapsed.contains(&project.id) {
+            let goals: Vec<&'a Goal> = self
+                .input
                 .goals
                 .iter()
-                .filter(|goal| goal.project_id == project.id)
-                .collect()
-        };
-        let mut y = top;
-        for (n, goal) in goals.iter().enumerate() {
-            let goal_node = self.out.nodes.len();
-            y += self.goal_band(goal, y);
-            self.out.edges.push(Edge {
-                from: project_node,
-                to: goal_node,
-                dependency: false,
-            });
-            if n + 1 < goals.len() {
-                y += GOAL_GAP;
+                .filter(|goal| goal.project_id == project.id && goal.parent_id.is_none())
+                .collect();
+            let children: Vec<&'a Project> = self
+                .input
+                .projects
+                .iter()
+                .filter(|p| p.parent_id.as_deref() == Some(project.id.as_str()))
+                .collect();
+            for goal in goals {
+                if y > top {
+                    y += GOAL_GAP;
+                }
+                let child = self.out.nodes.len();
+                y += self.goal_block(goal, x + GOAL_OFFSET, y);
+                self.out.edges.push(Edge {
+                    from: node,
+                    to: child,
+                    dependency: false,
+                });
+            }
+            for sub in children {
+                if y > top {
+                    y += GOAL_GAP;
+                }
+                let child = self.out.nodes.len();
+                y += self.project_block(sub, x + SUBPROJECT_OFFSET, y);
+                self.out.edges.push(Edge {
+                    from: node,
+                    to: child,
+                    dependency: false,
+                });
             }
         }
-        if goals.is_empty() {
-            y += 2.0 * PROJECT_HH;
-        }
-        self.out.nodes[project_node].y = f32::midpoint(top, y);
-        (y - top).max(2.0 * PROJECT_HH)
+        let height = (y - top).max(2.0 * PROJECT_HH);
+        self.out.nodes[node].y = top + height / 2.0;
+        height
     }
 
     /// Dependency edges between visible tasks only.
@@ -346,7 +399,8 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// Lay out every visible project, goal, and task. Deterministic for a given input.
+/// Lay out every visible project, goal, and task, roots first. Deterministic for a given
+/// input.
 pub(crate) fn layout(input: &Input<'_>) -> Layout {
     let mut builder = Builder {
         input,
@@ -360,8 +414,8 @@ pub(crate) fn layout(input: &Input<'_>) -> Layout {
         out: Layout::default(),
     };
     let mut y = 0.0;
-    for project in input.projects {
-        y += builder.project(project, y) + PROJECT_GAP;
+    for project in input.projects.iter().filter(|p| p.parent_id.is_none()) {
+        y += builder.project_block(project, 0.0, y) + PROJECT_GAP;
     }
     builder.dependencies();
     builder.bounds();
@@ -374,8 +428,13 @@ mod tests {
     use tasky_core::{Task, Timestamp};
 
     fn project(id: &str) -> Project {
+        project_in(id, None)
+    }
+
+    fn project_in(id: &str, parent: Option<&str>) -> Project {
         Project::new(
             id.into(),
+            parent.map(str::to_owned),
             id.into(),
             id.to_uppercase(),
             None,
@@ -386,9 +445,14 @@ mod tests {
     }
 
     fn goal(id: &str, project: &str) -> Goal {
+        goal_in(id, project, None)
+    }
+
+    fn goal_in(id: &str, project: &str, parent: Option<&str>) -> Goal {
         Goal::new(
             id.into(),
             project.into(),
+            parent.map(str::to_owned),
             id.into(),
             id.to_uppercase(),
             String::new(),
@@ -551,7 +615,7 @@ mod tests {
         assert!(tb.y - ta.y >= 2.0 * TASK_R);
         let (p1, p2) = (node(&layout, "P1"), node(&layout, "P2"));
         assert!(p2.y - p1.y >= 2.0 * PROJECT_HH);
-        assert!(layout.bounds.w > COL_GOAL && layout.bounds.h > 0.0);
+        assert!(layout.bounds.w > GOAL_OFFSET && layout.bounds.h > 0.0);
         assert!((layout.bounds.x + PROJECT_HW).abs() < 0.01);
     }
 
@@ -626,6 +690,78 @@ mod tests {
     }
 
     #[test]
+    fn nested_projects_and_goals_indent_beneath_their_parents() {
+        let projects = [project("p"), project_in("sub", Some("p"))];
+        let goals = [
+            goal("g", "p"),
+            goal_in("child", "p", Some("g")),
+            goal("sg", "sub"),
+        ];
+        let tasks = [
+            task("a", "g", &[], false),
+            task("b", "child", &["a"], false),
+            task("c", "sg", &[], false),
+        ];
+        let layout = build(&projects, &goals, &tasks);
+        let (p, sub) = (node(&layout, "P"), node(&layout, "SUB"));
+        let (g, child, sg) = (
+            node(&layout, "G"),
+            node(&layout, "CHILD"),
+            node(&layout, "SG"),
+        );
+        assert!(sub.x > p.x, "sub-project indents right");
+        assert!(sub.y > g.y, "sub-project sits below the parent's goals");
+        assert!(child.x > g.x, "sub-goal indents right of its parent goal");
+        assert!(
+            child.y > node(&layout, "A").y,
+            "sub-goal sits below the parent's tasks"
+        );
+        assert!(
+            sg.x > sub.x,
+            "a sub-project's goal is right of the sub-project"
+        );
+        assert!(node(&layout, "B").x > child.x && node(&layout, "C").x > sg.x);
+        let joined: Vec<(&str, &str)> = layout
+            .edges
+            .iter()
+            .filter(|e| !e.dependency)
+            .map(|e| {
+                (
+                    layout.nodes[e.from].title.as_str(),
+                    layout.nodes[e.to].title.as_str(),
+                )
+            })
+            .collect();
+        assert!(joined.contains(&("P", "SUB")));
+        assert!(joined.contains(&("G", "CHILD")));
+        assert!(joined.contains(&("SUB", "SG")));
+        assert!(
+            !joined.contains(&("P", "CHILD")),
+            "a sub-goal hangs off its goal, not the project"
+        );
+        assert!(
+            p.y > g.y && p.y < sub.y,
+            "project centred on its whole block"
+        );
+
+        let collapsed: HashSet<String> = ["g".to_owned()].into_iter().collect();
+        let layout = build_with(&projects, &goals, &tasks, &collapsed);
+        let titles: Vec<&str> = layout.nodes.iter().map(|n| n.title.as_str()).collect();
+        assert!(
+            !titles.contains(&"CHILD") && !titles.contains(&"B"),
+            "subtree hidden"
+        );
+        assert!(titles.contains(&"SUB") && titles.contains(&"C"));
+        let collapsed: HashSet<String> = ["p".to_owned()].into_iter().collect();
+        let layout = build_with(&projects, &goals, &tasks, &collapsed);
+        assert_eq!(
+            layout.nodes.len(),
+            1,
+            "collapsing a project hides sub-projects too"
+        );
+    }
+
+    #[test]
     fn complete_goals_and_fully_complete_projects_start_collapsed() {
         let projects = [project("done"), project("mixed"), project("empty")];
         let goals = [
@@ -641,5 +777,16 @@ mod tests {
         assert!(collapsed.contains("done"), "every goal complete");
         assert!(!collapsed.contains("mixed"));
         assert!(!collapsed.contains("empty"), "nothing to collapse");
+
+        let projects = [project("root"), project_in("leaf", Some("root"))];
+        let goals = [complete_goal("lg", "leaf")];
+        let collapsed = default_collapsed(&projects, &goals);
+        assert!(collapsed.contains("leaf"));
+        assert!(
+            collapsed.contains("root"),
+            "all its sub-projects are finished"
+        );
+        let goals = [complete_goal("lg", "leaf"), goal("open", "root")];
+        assert!(!default_collapsed(&projects, &goals).contains("root"));
     }
 }

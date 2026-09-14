@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::{Value, json};
 use std::{
     io::{self, Read, Write},
@@ -10,11 +10,13 @@ use tasky_store::{Change, Store, TaskFilter, TaskScope, default_path};
 
 #[derive(Parser)]
 #[command(
+    name = "tasky",
     version,
     about = "Track projects of any kind, their goals, and a DAG of tasks",
-    after_help = "Goals are referenced as PROJECT/SLUG, as a slug that is unique across \
-                  projects, or by a unique prefix or suffix of their ID. Projects are \
-                  referenced by slug or ID fragment; tasks by ID fragment."
+    after_help = "Projects are referenced by path, such as app or app/mobile, or by a unique \
+                  prefix or suffix of their ID. Goals are referenced as PROJECT/SLUG, as a \
+                  slug that is unique across projects, or by an ID fragment. Tasks are \
+                  referenced by ID fragment."
 )]
 struct Cli {
     /// Path to the SQLite database
@@ -35,6 +37,9 @@ enum Command {
     Migrate,
     /// Open the graph viewer on this database; returns when the window closes
     Ui,
+    /// Print the help of every command as Markdown; feeds the agent skill's reference
+    #[command(hide = true)]
+    Reference,
     /// Anything work is organized under; optionally tied to a repository
     #[command(subcommand)]
     Project(ProjectCommand),
@@ -48,12 +53,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ProjectCommand {
-    /// Create a project
+    /// Create a project, optionally inside another project
     Add {
-        /// Lowercase letters, digits, and inner hyphens
+        /// Lowercase letters, digits, and inner hyphens; unique among siblings
         slug: String,
         /// Human-readable name; defaults to the slug
         name: Option<String>,
+        /// Parent project path, such as app or app/mobile
+        #[arg(long)]
+        parent: Option<String>,
         /// Local checkout of the repository, for coding projects
         #[arg(long)]
         repo_path: Option<String>,
@@ -75,12 +83,15 @@ enum ProjectCommand {
 
 #[derive(Subcommand)]
 enum GoalCommand {
-    /// Create a draft goal in a project
+    /// Create a draft goal in a project, optionally inside another goal of that project
     Add {
         project: String,
         /// Lowercase letters, digits, and inner hyphens; unique within the project
         slug: String,
         title: String,
+        /// Parent goal, such as app/auth
+        #[arg(long)]
+        parent: Option<String>,
         #[arg(long, default_value = "")]
         description: String,
         #[command(flatten)]
@@ -174,10 +185,16 @@ enum TaskCommand {
     Add {
         goal: String,
         title: String,
-        #[arg(long, default_value = "")]
-        body: String,
+        #[command(flatten)]
+        body: BodySource,
         #[command(flatten)]
         test_plan: TestPlanSource,
+    },
+    /// Replace the body from --text, --file, or stdin
+    Body {
+        task: String,
+        #[command(flatten)]
+        source: TextSource,
     },
     /// Replace the validation steps from --text, --file, or stdin
     TestPlan {
@@ -264,6 +281,31 @@ struct LinkTarget {
     url: Option<String>,
 }
 
+/// Optional body given at creation time.
+#[derive(Args)]
+#[group(multiple = false)]
+struct BodySource {
+    /// What to build, given inline
+    #[arg(long)]
+    body: Option<String>,
+    /// Read the body from a file
+    #[arg(long)]
+    body_file: Option<PathBuf>,
+}
+
+impl BodySource {
+    fn read(self) -> Result<String> {
+        if let Some(text) = self.body {
+            return Ok(text);
+        }
+        self.body_file
+            .as_deref()
+            .map(read_file)
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+}
+
 /// Optional test plan given at creation time.
 #[derive(Args)]
 #[group(multiple = false)]
@@ -340,11 +382,17 @@ fn execute(db: &Path, command: Command) -> Result<Option<Value>> {
             tasky_ui::run(db)?;
             return Ok(None);
         }
+        Command::Reference => {
+            print!("{}", reference());
+            return Ok(None);
+        }
         _ => {}
     }
     let mut store = Store::open(db)?;
     Ok(Some(match command {
-        Command::Init | Command::Migrate | Command::Ui => unreachable!("handled above"),
+        Command::Init | Command::Migrate | Command::Ui | Command::Reference => {
+            unreachable!("handled above")
+        }
         Command::Project(command) => run_project(&mut store, command)?,
         Command::Goal(command) => run_goal(&mut store, command)?,
         Command::Task(command) => run_task(&mut store, command)?,
@@ -356,11 +404,12 @@ fn run_project(store: &mut Store, command: ProjectCommand) -> Result<Value> {
         ProjectCommand::Add {
             slug,
             name,
+            parent,
             repo_path,
             repo_url,
         } => {
             let name = name.unwrap_or_else(|| slug.clone());
-            json!(store.create_project(slug, name, repo_path, repo_url)?)
+            json!(store.create_project(parent.as_deref(), slug, name, repo_path, repo_url)?)
         }
         ProjectCommand::List => json!(store.projects()?),
         ProjectCommand::Repo { project, change } => {
@@ -377,9 +426,17 @@ fn run_goal(store: &mut Store, command: GoalCommand) -> Result<Value> {
             project,
             slug,
             title,
+            parent,
             description,
             spec,
-        } => json!(store.create_goal(&project, slug, title, description, spec.read()?)?),
+        } => json!(store.create_goal(
+            &project,
+            parent.as_deref(),
+            slug,
+            title,
+            description,
+            spec.read()?
+        )?),
         GoalCommand::List { project } => json!(store.goals(project.as_deref())?),
         GoalCommand::Show { goal } => json!(store.goal_detail(&goal)?),
         GoalCommand::Spec {
@@ -403,7 +460,8 @@ fn run_task(store: &mut Store, command: TaskCommand) -> Result<Value> {
             title,
             body,
             test_plan,
-        } => json!(store.create_task(&goal, title, body, test_plan.read()?)?),
+        } => json!(store.create_task(&goal, title, body.read()?, test_plan.read()?)?),
+        TaskCommand::Body { task, source } => json!(store.set_body(&task, source.read()?)?),
         TaskCommand::TestPlan { task, source } => {
             json!(store.set_test_plan(&task, source.read()?)?)
         }
@@ -435,6 +493,47 @@ fn run_task(store: &mut Store, command: TaskCommand) -> Result<Value> {
             json!(store.add_link(&task, kind, reference)?)
         }
     })
+}
+
+/// Every command's long help, depth first, as one Markdown document.
+fn reference() -> String {
+    fn walk(command: &mut clap::Command, path: &str, out: &mut String) {
+        if command.is_hide_set() || command.get_name() == "help" {
+            return;
+        }
+        let full = if path.is_empty() {
+            command.get_name().to_owned()
+        } else {
+            format!("{path} {}", command.get_name())
+        };
+        let help = command.render_long_help().to_string();
+        out.push_str("## `");
+        out.push_str(&full);
+        out.push_str("`\n\n```text\n");
+        out.push_str(help.trim_end());
+        out.push_str("\n```\n\n");
+        let children: Vec<String> = command
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_owned())
+            .collect();
+        for name in children {
+            if let Some(sub) = command.find_subcommand_mut(&name) {
+                walk(sub, &full, out);
+            }
+        }
+    }
+    let mut out = String::from(
+        "# Tasky command reference\n\nGenerated by `tasky reference`; do not edit by hand. \
+         Regenerate with `scripts/update-skill-reference.sh` after changing the CLI.\n\n",
+    );
+    let mut root = Cli::command();
+    root.build();
+    walk(&mut root, "", &mut out);
+    // The default database path is machine-specific; keep the reference portable.
+    out.replace(
+        &default_path().display().to_string(),
+        "$XDG_DATA_HOME/tasky/tasky.db",
+    )
 }
 
 fn main() {

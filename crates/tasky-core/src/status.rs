@@ -77,6 +77,14 @@ text_enum! {
     }
 }
 
+impl GoalStatus {
+    /// Whether the goal is finished for good: complete or cancelled.
+    #[must_use]
+    pub const fn is_closed(self) -> bool {
+        matches!(self, Self::Complete | Self::Cancelled)
+    }
+}
+
 impl TaskStatus {
     /// Whether the task still has work outstanding, that is, it is neither done nor cancelled.
     #[must_use]

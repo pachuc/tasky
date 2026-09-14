@@ -4,10 +4,11 @@
 mod layout;
 
 use gpui::{
-    App, Application, AssetSource, BorderStyle, Bounds, ClickEvent, ContentMask, Context,
-    CursorStyle, Div, FontWeight, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Path, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign,
-    TextRun, Window, WindowBounds, WindowOptions, WrappedLine, black, canvas, div, fill, point,
+    App, Application, AssetSource, BorderStyle, Bounds, ClickEvent, ClipboardItem, ContentMask,
+    Context, CursorStyle, Div, FocusHandle, FontWeight, HighlightStyle, Hsla, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, Point, ScrollDelta,
+    ScrollWheelEvent, SharedString, Size, Stateful, StyledText, TextAlign, TextLayout, TextRun,
+    Window, WindowBounds, WindowOptions, WrappedLine, black, canvas, div, fill, hsla, point,
     prelude::*, px, quad, rgb, size, svg, transparent_black, white,
 };
 use layout::{Kind, Layout, Node, Rect, State};
@@ -15,6 +16,7 @@ use std::{
     borrow::Cow,
     cell::Cell,
     collections::{BTreeMap, HashSet},
+    ops::Range,
     rc::Rc,
     time::Instant,
 };
@@ -117,10 +119,18 @@ struct Viewer {
     legend_open: bool,
     /// When the viewer started; drives the pulse on nodes being worked on.
     started: Instant,
+    /// Keyboard focus, so copy shortcuts reach the viewer.
+    focus: FocusHandle,
+    /// Highlighted text in the details panel.
+    selection: Option<Selection>,
+    /// The left button is held after starting a selection, so moves extend it.
+    selecting: bool,
+    /// Every selectable text field in the panel as of the latest frame, by field id.
+    fields: Vec<Field>,
 }
 
 impl Viewer {
-    fn new(snapshot: Snapshot) -> Self {
+    fn new(snapshot: Snapshot, cx: &mut Context<Self>) -> Self {
         let collapsed = layout::default_collapsed(&snapshot.projects, &snapshot.goals);
         let layout = Rc::new(snapshot.layout(&collapsed));
         Self {
@@ -140,6 +150,10 @@ impl Viewer {
             selected: None,
             legend_open: false,
             started: Instant::now(),
+            focus: cx.focus_handle(),
+            selection: None,
+            selecting: false,
+            fields: Vec::new(),
         }
     }
 
@@ -183,6 +197,108 @@ impl Viewer {
             self.selected = None;
         } else {
             self.selected = Some(id);
+        }
+        self.selection = None;
+    }
+
+    /// The panel field under a window position, if any.
+    fn field_at(&self, position: Point<Pixels>) -> Option<usize> {
+        self.fields
+            .iter()
+            .position(|field| field.layout.bounds().contains(&position))
+    }
+
+    /// The byte offset in a field nearest to a window position.
+    fn offset_in(&self, field: usize, position: Point<Pixels>) -> usize {
+        self.fields[field]
+            .layout
+            .index_for_position(position)
+            .unwrap_or_else(|nearest| nearest)
+    }
+
+    /// Left button pressed over the panel: start a selection on the field under the mouse,
+    /// or clear the selection when there is none. A double click takes the word, a triple
+    /// click the whole field. Returns whether a field was hit.
+    fn begin_selection(&mut self, event: &MouseDownEvent) -> bool {
+        let Some(field) = self.field_at(event.position) else {
+            self.selection = None;
+            return false;
+        };
+        let offset = self.offset_in(field, event.position);
+        let text = &self.fields[field].text;
+        let (anchor, head) = match event.click_count {
+            1 => (offset, offset),
+            2 => word_at(text, offset),
+            _ => (0, text.len()),
+        };
+        self.selection = Some(Selection {
+            field,
+            anchor,
+            head,
+        });
+        self.selecting = event.click_count == 1;
+        true
+    }
+
+    /// Mouse moved while a selection is being dragged out: follow it. Registered on both
+    /// the root and the panel, since the panel occludes hover on the root beneath it.
+    fn drag_selection(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.selecting = false;
+            return;
+        }
+        self.extend_selection(event.position);
+        cx.notify();
+    }
+
+    /// Extend the selection being dragged out to the mouse position.
+    fn extend_selection(&mut self, position: Point<Pixels>) {
+        if let Some(selection) = &mut self.selection {
+            selection.head = self.fields[selection.field]
+                .layout
+                .index_for_position(position)
+                .unwrap_or_else(|nearest| nearest);
+        }
+    }
+
+    /// Release after a drag: on platforms with a primary selection, the text goes there.
+    fn finish_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        self.selecting = false;
+        if let Some(text) = self.selected_text() {
+            cx.write_to_primary(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let range = selection.range();
+        if range.is_empty() {
+            return None;
+        }
+        Some(self.fields[selection.field].text[range].to_owned())
+    }
+
+    /// Ctrl-C or Cmd-C copies the selection; Escape clears it.
+    fn key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let copy = keystroke.modifiers.control || keystroke.modifiers.platform;
+        match keystroke.key.as_str() {
+            "c" if copy => {
+                if let Some(text) = self.selected_text() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            "escape" => {
+                self.selection = None;
+                cx.notify();
+            }
+            _ => {}
         }
     }
 
@@ -404,7 +520,6 @@ fn shape_block(
     font_size: f32,
     bold: bool,
     wrap_width: f32,
-    clamp: usize,
 ) -> Option<Block> {
     if font_size < MIN_FONT_PX || text.trim().is_empty() {
         return None;
@@ -413,13 +528,7 @@ fn shape_block(
     let run = text_run(window, text.len(), bold);
     let lines = window
         .text_system()
-        .shape_text(
-            text,
-            px(font_size),
-            &[run],
-            Some(px(wrap_width)),
-            Some(clamp),
-        )
+        .shape_text(text, px(font_size), &[run], Some(px(wrap_width)), None)
         .ok()?
         .into_vec();
     let line_height = px(font_size * 1.25);
@@ -434,7 +543,46 @@ fn shape_block(
     })
 }
 
-/// Paint a node's title, wrapped and centred inside its shape.
+/// Shape `text` wrapped to `box_w`, but only if the whole block also fits in `box_h`.
+fn shape_fitting(
+    window: &Window,
+    text: &str,
+    font_size: f32,
+    (box_w, box_h): (f32, f32),
+) -> Option<Block> {
+    shape_block(window, text, font_size, true, box_w)
+        .filter(|block| f32::from(block.height) <= box_h)
+}
+
+/// Shape a title to fit a text box, truncating it with an ellipsis when the full text
+/// would spill past the box. Returns `None` when not even the ellipsis fits.
+fn shape_title(window: &Window, text: &str, font_size: f32, text_box: (f32, f32)) -> Option<Block> {
+    if let Some(block) = shape_fitting(window, text, font_size, text_box) {
+        return Some(block);
+    }
+    // Byte offset of every character boundary, so prefixes never split a character.
+    let ends: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain([text.len()])
+        .collect();
+    let candidate = |chars: usize| format!("{}\u{2026}", text[..ends[chars]].trim_end());
+    // Binary search for the longest prefix that still fits once the ellipsis is appended:
+    // keeping 0 characters is the lone ellipsis, keeping `n` is the first `n` characters.
+    let (mut lo, mut hi) = (0, ends.len() - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if shape_fitting(window, &candidate(mid), font_size, text_box).is_some() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    shape_fitting(window, &candidate(lo), font_size, text_box)
+}
+
+/// Paint a node's title, wrapped and centred inside its shape, truncated with an
+/// ellipsis when it would overflow.
 fn paint_node_text(
     center: Point<f32>,
     (hw, hh): (f32, f32),
@@ -453,12 +601,9 @@ fn paint_node_text(
         Kind::Goal => 0.24,
         Kind::Task => 0.22,
     } * hh;
-    let Some(block) = shape_block(window, &node.title, font_size, true, box_w, 4) else {
+    let Some(block) = shape_title(window, &node.title, font_size, (box_w, box_h)) else {
         return;
     };
-    if f32::from(block.height) > box_h {
-        return;
-    }
     let x = px(center.x - box_w / 2.0);
     let mut y = px(center.y) - block.height / 2.0;
     let area = Bounds {
@@ -632,14 +777,31 @@ fn paint_graph(
 }
 
 impl Render for Viewer {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.focus.is_focused(window) {
+            window.focus(&self.focus);
+        }
+        let panel = self.panel(cx);
         div()
             .relative()
             .size_full()
             .bg(white())
             .text_color(black())
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                this.key_down(event, cx);
+            }))
+            .on_mouse_move(cx.listener(Self::drag_selection))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_selection(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_selection(cx)),
+            )
             .child(self.graph(cx))
-            .children(self.panel(cx))
+            .children(panel)
             .child(self.legend(cx))
     }
 }
@@ -656,11 +818,14 @@ impl Viewer {
             .cursor(CursorStyle::OpenHand)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _, _| {
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
                     this.press = Some(Press {
                         last: event.position,
                         dragged: false,
                     });
+                    if this.selection.take().is_some() {
+                        cx.notify();
+                    }
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
@@ -797,9 +962,18 @@ impl Viewer {
     }
 
     /// The details panel for the selected node, overlaid on the right.
-    fn panel(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        let id = self.selected.as_deref()?;
-        let body = details_for(&self.snapshot, id)?;
+    fn panel(&mut self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let mut panel = Panel {
+            snapshot: &self.snapshot,
+            selection: self.selection,
+            fields: Vec::new(),
+        };
+        let body = self
+            .selected
+            .as_deref()
+            .and_then(|id| details_for(&mut panel, id));
+        self.fields = panel.fields;
+        let body = body?;
         let close = div()
             .id("close")
             .cursor_pointer()
@@ -810,6 +984,7 @@ impl Viewer {
             .child("×")
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.selected = None;
+                this.selection = None;
                 cx.notify();
             }));
         Some(
@@ -827,6 +1002,16 @@ impl Viewer {
                 .text_color(white())
                 .border_l_1()
                 .border_color(rgb(0x0033_3333))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        if this.begin_selection(event) {
+                            cx.stop_propagation();
+                        }
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_move(cx.listener(Self::drag_selection))
                 .child(
                     div()
                         .flex()
@@ -922,17 +1107,122 @@ fn labelled(label: &'static str, content: impl IntoElement) -> Div {
         .child(content)
 }
 
-/// A labelled section holding plain text; empty text shows as a dash.
-fn section(label: &'static str, body: impl Into<SharedString>) -> Div {
-    let body: SharedString = body.into();
-    labelled(
-        label,
-        div().text_sm().child(if body.is_empty() {
+/// Highlight behind selected panel text.
+fn selection_color() -> Hsla {
+    hsla(0.58, 0.9, 0.55, 0.6)
+}
+
+/// The byte range of the word around `offset`, or of the gap when `offset` is between words.
+fn word_at(text: &str, offset: usize) -> (usize, usize) {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let start = text[..offset]
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| is_word(c))
+        .last()
+        .map_or(offset, |(i, _)| i);
+    let end = text[offset..]
+        .char_indices()
+        .find(|&(_, c)| !is_word(c))
+        .map_or(text.len(), |(i, _)| offset + i);
+    (start, end)
+}
+
+/// A run of selected text in the details panel: the field it lives in and the byte
+/// offsets where the selection started and where it currently ends.
+#[derive(Debug, Clone, Copy)]
+struct Selection {
+    field: usize,
+    anchor: usize,
+    head: usize,
+}
+
+impl Selection {
+    fn range(self) -> Range<usize> {
+        self.anchor.min(self.head)..self.anchor.max(self.head)
+    }
+}
+
+/// A selectable text field in the details panel and its layout from the frame that built
+/// it, which maps mouse positions to byte offsets.
+struct Field {
+    text: SharedString,
+    layout: TextLayout,
+}
+
+/// Builds the details panel for one frame, handing out a field id to every piece of
+/// selectable text and painting the current selection into it.
+struct Panel<'a> {
+    snapshot: &'a Snapshot,
+    selection: Option<Selection>,
+    fields: Vec<Field>,
+}
+
+impl Panel<'_> {
+    /// Plain text the user can select and copy.
+    fn text(&mut self, text: impl Into<SharedString>) -> Div {
+        let text: SharedString = text.into();
+        let id = self.fields.len();
+        let highlight = self
+            .selection
+            .filter(|selection| selection.field == id)
+            .map(Selection::range)
+            .filter(|range| !range.is_empty())
+            .map(|range| {
+                (
+                    range,
+                    HighlightStyle {
+                        background_color: Some(selection_color()),
+                        ..HighlightStyle::default()
+                    },
+                )
+            });
+        let styled = StyledText::new(text.clone()).with_highlights(highlight);
+        self.fields.push(Field {
+            text,
+            layout: styled.layout().clone(),
+        });
+        div().cursor_text().child(styled)
+    }
+
+    fn title(&mut self, text: &str) -> Div {
+        self.text(text.to_owned())
+            .text_lg()
+            .font_weight(FontWeight::BOLD)
+    }
+
+    /// A labelled section holding plain text; empty text shows as a dash.
+    fn section(&mut self, label: &'static str, body: impl Into<SharedString>) -> Div {
+        let body: SharedString = body.into();
+        let body = if body.is_empty() {
             SharedString::from("—")
         } else {
             body
-        }),
-    )
+        };
+        labelled(label, self.text(body).text_sm())
+    }
+
+    /// A row of badge plus text, used for lists of related entities.
+    fn row(&mut self, pill: Div, text: impl Into<SharedString>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_sm()
+            .child(pill)
+            .child(self.text(text))
+    }
+
+    /// Rows for the tasks with the given IDs, in that order.
+    fn tasks(&mut self, ids: &[String]) -> Div {
+        let snapshot = self.snapshot;
+        list(
+            ids.iter()
+                .filter_map(|id| snapshot.tasks.iter().find(|t| t.task.id == *id))
+                .map(|t| self.row(task_badge(t), t.task.title.clone()))
+                .collect(),
+        )
+    }
 }
 
 /// The same hue at reduced lightness, used to outline badges and nodes. White has no hue to
@@ -962,30 +1252,12 @@ fn badge(label: impl Into<SharedString>, state: State) -> Div {
         .child(label.into())
 }
 
-/// A row of badge plus text, used for lists of related entities.
-fn row(pill: Div, text: impl Into<SharedString>) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .text_sm()
-        .child(pill)
-        .child(text.into())
-}
-
 /// A vertical list of rows; an empty list shows as a dash.
 fn list(rows: Vec<Div>) -> Div {
     if rows.is_empty() {
         return div().text_sm().child("—");
     }
     div().flex().flex_col().gap_1().children(rows)
-}
-
-fn title(text: &str) -> Div {
-    div()
-        .text_lg()
-        .font_weight(FontWeight::BOLD)
-        .child(text.to_owned())
 }
 
 /// Human wording for a status, with the ready/blocked split for todo tasks.
@@ -1021,29 +1293,26 @@ struct Details {
     content: Div,
 }
 
-fn details_for(snapshot: &Snapshot, id: &str) -> Option<Details> {
+fn details_for(panel: &mut Panel<'_>, id: &str) -> Option<Details> {
+    let snapshot = panel.snapshot;
     if let Some(task) = snapshot.tasks.iter().find(|t| t.task.id == id) {
-        return Some(task_details(snapshot, task));
+        return Some(task_details(panel, task));
     }
     if let Some(goal) = snapshot.goals.iter().find(|g| g.id == id) {
-        return Some(goal_details(snapshot, goal));
+        return Some(goal_details(panel, goal));
     }
     snapshot
         .projects
         .iter()
         .find(|p| p.id == id)
-        .map(|project| project_details(snapshot, project))
+        .map(|project| project_details(panel, project))
 }
 
-fn task_details(snapshot: &Snapshot, detail: &TaskDetail) -> Details {
-    let related = |ids: &[String]| {
-        list(
-            ids.iter()
-                .filter_map(|id| snapshot.tasks.iter().find(|t| t.task.id == *id))
-                .map(|t| row(task_badge(t), t.task.title.clone()))
-                .collect(),
-        )
-    };
+fn task_details(panel: &mut Panel<'_>, detail: &TaskDetail) -> Details {
+    let snapshot = panel.snapshot;
+    let depends_on = panel.tasks(&detail.depends_on);
+    let blocked_by = panel.tasks(&detail.blocked_by);
+    let dependents = panel.tasks(&detail.dependents);
     let links = detail
         .links
         .iter()
@@ -1054,56 +1323,72 @@ fn task_details(snapshot: &Snapshot, detail: &TaskDetail) -> Details {
         .flex()
         .flex_col()
         .gap_3()
-        .child(title(&detail.task.title))
+        .child(panel.title(&detail.task.title))
         .child(labelled("Status", div().flex().child(task_badge(detail))))
-        .child(section("Where", location(snapshot, detail)))
-        .child(section("Body", detail.task.body.clone()))
-        .child(section("Test plan", detail.task.test_plan.clone()))
-        .child(section(
-            "Pull request",
-            detail.task.pr.clone().unwrap_or_default(),
-        ))
-        .child(labelled("Depends on", related(&detail.depends_on)))
-        .child(labelled("Blocked by", related(&detail.blocked_by)))
-        .child(labelled("Dependents", related(&detail.dependents)))
-        .child(section("Links", links))
-        .child(section("Created", detail.task.created_at.to_string()))
-        .child(section("Updated", detail.task.updated_at.to_string()))
-        .child(section(
-            "Completed",
-            detail
-                .task
-                .completed_at
-                .map(|t| t.to_string())
-                .unwrap_or_default(),
-        ));
+        .child(panel.section("Where", location(snapshot, detail)))
+        .child(panel.section("Body", detail.task.body.clone()))
+        .child(panel.section("Test plan", detail.task.test_plan.clone()))
+        .child(panel.section("Pull request", detail.task.pr.clone().unwrap_or_default()))
+        .child(labelled("Depends on", depends_on))
+        .child(labelled("Blocked by", blocked_by))
+        .child(labelled("Dependents", dependents))
+        .child(panel.section("Links", links))
+        .child(panel.section("Created", detail.task.created_at.to_string()))
+        .child(panel.section("Updated", detail.task.updated_at.to_string()))
+        .child(
+            panel.section(
+                "Completed",
+                detail
+                    .task
+                    .completed_at
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
+            ),
+        );
     Details {
         heading: "Task".to_owned(),
         content,
     }
 }
 
-fn goal_details(snapshot: &Snapshot, goal: &Goal) -> Details {
+fn goal_details(panel: &mut Panel<'_>, goal: &Goal) -> Details {
+    let snapshot = panel.snapshot;
     let tasks = list(
         snapshot
             .tasks
             .iter()
             .filter(|t| t.task.goal_id == goal.id)
-            .map(|t| row(task_badge(t), t.task.title.clone()))
+            .map(|t| panel.row(task_badge(t), t.task.title.clone()))
+            .collect(),
+    );
+    let parent = goal
+        .parent_id
+        .as_deref()
+        .and_then(|id| snapshot.goals.iter().find(|g| g.id == id))
+        .map(|g| g.title.clone())
+        .unwrap_or_default();
+    let subgoals = list(
+        snapshot
+            .goals
+            .iter()
+            .filter(|g| g.parent_id.as_deref() == Some(goal.id.as_str()))
+            .map(|g| panel.row(goal_badge(g), g.title.clone()))
             .collect(),
     );
     let content = div()
         .flex()
         .flex_col()
         .gap_3()
-        .child(title(&goal.title))
+        .child(panel.title(&goal.title))
         .child(labelled("Status", div().flex().child(goal_badge(goal))))
-        .child(section("Description", goal.description.clone()))
-        .child(section("Spec", goal.spec.clone().unwrap_or_default()))
+        .child(panel.section("Parent goal", parent))
+        .child(panel.section("Description", goal.description.clone()))
+        .child(panel.section("Spec", goal.spec.clone().unwrap_or_default()))
+        .child(labelled("Sub-goals", subgoals))
         .child(labelled("Tasks", tasks))
-        .child(section("Created", goal.created_at.to_string()))
-        .child(section("Updated", goal.updated_at.to_string()))
-        .child(section(
+        .child(panel.section("Created", goal.created_at.to_string()))
+        .child(panel.section("Updated", goal.updated_at.to_string()))
+        .child(panel.section(
             "Completed",
             goal.completed_at.map(|t| t.to_string()).unwrap_or_default(),
         ));
@@ -1113,30 +1398,46 @@ fn goal_details(snapshot: &Snapshot, goal: &Goal) -> Details {
     }
 }
 
-fn project_details(snapshot: &Snapshot, project: &Project) -> Details {
+fn project_details(panel: &mut Panel<'_>, project: &Project) -> Details {
+    let snapshot = panel.snapshot;
     let goals = list(
         snapshot
             .goals
             .iter()
-            .filter(|g| g.project_id == project.id)
-            .map(|g| row(goal_badge(g), g.title.clone()))
+            .filter(|g| g.project_id == project.id && g.parent_id.is_none())
+            .map(|g| panel.row(goal_badge(g), g.title.clone()))
             .collect(),
     );
+    let parent = project
+        .parent_id
+        .as_deref()
+        .and_then(|id| snapshot.projects.iter().find(|p| p.id == id))
+        .map(|p| p.name.clone())
+        .unwrap_or_default();
+    let subprojects = snapshot
+        .projects
+        .iter()
+        .filter(|p| p.parent_id.as_deref() == Some(project.id.as_str()))
+        .map(|p| p.name.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
     let content = div()
         .flex()
         .flex_col()
         .gap_3()
-        .child(title(&project.name))
-        .child(section(
+        .child(panel.title(&project.name))
+        .child(panel.section("Parent project", parent))
+        .child(panel.section("Sub-projects", subprojects))
+        .child(panel.section(
             "Repository path",
             project.repo_path.clone().unwrap_or_default(),
         ))
-        .child(section(
+        .child(panel.section(
             "Repository URL",
             project.repo_url.clone().unwrap_or_default(),
         ))
         .child(labelled("Goals", goals))
-        .child(section("Created", project.created_at.to_string()));
+        .child(panel.section("Created", project.created_at.to_string()));
     Details {
         heading: "Project".to_owned(),
         content,
@@ -1163,7 +1464,7 @@ pub fn run(db: &std::path::Path) -> anyhow::Result<()> {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|_| Viewer::new(snapshot)),
+                |_, cx| cx.new(|cx| Viewer::new(snapshot, cx)),
             )
             .expect("open Tasky window");
             cx.on_window_closed(|cx| {

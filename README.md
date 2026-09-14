@@ -9,20 +9,25 @@ workflow.
 ## Model
 
 - A **project** is anything work is organized under, with a slug humans type, such as `app`.
-  A coding project may record the repository it is tied to as a local path, a remote URL, or
+  Projects nest without limit: a sub-project is a full project whose parent is another
+  project, addressed by path such as `app/mobile/ios`. Slugs are unique among siblings. A
+  coding project may record the repository it is tied to as a local path, a remote URL, or
   both; nothing requires either. One database holds any number of projects.
 - A **goal** is a high-level goal within a project, with a slug that is unique inside that
-  project. It may carry an optional **spec**: free text describing the goal in detail.
+  project at any depth. Goals nest without limit too: a sub-goal is a full goal whose parent
+  is another goal of the same project. A goal may carry an optional **spec**: free text
+  describing it in detail.
 - A **task** is the unit of work. Every task belongs to a goal. It carries a title, a body,
   a **test plan** listing the validation steps that prove it complete, and the link to the
   **pull request** that delivers it once one exists. Tasks depend on other tasks anywhere in
-  the same project, forming a DAG that is kept acyclic on every write. Dependencies never
-  cross projects.
+  the same root project, sub-projects included, forming a DAG that is kept acyclic on every
+  write. Dependencies never cross from one root project to another.
 - A **link** attaches a commit SHA or URL to a task.
 
-Goals go `draft → active → complete` or `cancelled`; a goal completes only when every
-task is done or cancelled. A spec can be written, replaced, or cleared while its goal is
-draft or active.
+Goals go `draft → active → complete` or `cancelled`. A goal completes only when every task
+directly under it is done or cancelled and every sub-goal is complete or cancelled, so a
+parent can never close ahead of its children. Cancelling likewise waits for sub-goals to
+close. A spec can be written, replaced, or cleared while its goal is draft or active.
 
 Tasks follow one path:
 
@@ -35,12 +40,14 @@ test plan; `fail` sends it back to in progress and `pass` marks it ready for mer
 records the merge and is allowed only from `ready_for_merge`. `cancel` works from any state
 that is not done or cancelled. No state can be skipped, and done and cancelled are terminal.
 "Blocked" and "ready" are derived, never stored. Dependencies can change only while a task is
-`todo`; the test plan and pull request can change until the task is done or cancelled.
+`todo`; the body, test plan, and pull request can change until the task is done or cancelled.
 
 IDs are ULIDs. Refer to a task by any unique prefix or suffix of its ID; the tail is the
 random part, so the last few characters are the easiest to type. Refer to a project by slug.
-Refer to a goal as `project/slug`, by its slug alone when no other project uses it, or by
-an ID fragment.
+Refer to a project by its path from the root, such as `app` or `app/mobile`. Refer to a
+goal as `PROJECT/slug` with that same project path, by its slug alone when no other project
+uses it, or by an ID fragment. `--project` and `--goal` filters include everything nested
+beneath the project or goal named.
 
 ## Quick start
 
@@ -94,17 +101,18 @@ Global flags: `--db PATH` (or `TASKY_DB`), `--json`, `--help`, `--version`.
 | `init` | Create an empty database and its schema |
 | `migrate` | Apply pending schema migrations to an existing database |
 | `ui` | Open the graph viewer on the database; returns when the window closes |
-| `project add SLUG [NAME] [--repo-path PATH] [--repo-url URL]` | Create a project; the name defaults to the slug |
-| `project list` / `project show PROJECT` | List projects / show one with goal and task counts |
+| `project add SLUG [NAME] [--parent PROJECT] [--repo-path PATH] [--repo-url URL]` | Create a project, optionally inside another; the name defaults to the slug |
+| `project list` / `project show PROJECT` | List every project / show one with its path, sub-project and goal counts, and task totals over its subtree |
 | `project repo PROJECT [--path PATH \| --clear-path] [--url URL \| --clear-url]` | Change the repository path and/or URL; unmentioned fields keep their value |
-| `goal add PROJECT SLUG TITLE [--description TEXT] [--spec TEXT \| --spec-file PATH]` | Create a draft goal, optionally with a spec |
-| `goal list [--project P]` | List goals, optionally within one project |
-| `goal show GOAL` | Show a goal with its project, spec, and task counts |
+| `goal add PROJECT SLUG TITLE [--parent GOAL] [--description TEXT] [--spec TEXT \| --spec-file PATH]` | Create a draft goal, optionally inside another goal of the project and optionally with a spec |
+| `goal list [--project P]` | List goals, optionally within one project and its sub-projects |
+| `goal show GOAL` | Show a goal with its project path, sub-goal count, spec, and task totals over its subtree |
 | `goal spec GOAL [--text TEXT \| --file PATH \| --clear]` | Replace the spec (stdin when no flag is given) or remove it |
 | `goal activate GOAL` | Draft → active |
 | `goal complete GOAL` | Active with all tasks finished → complete |
 | `goal cancel GOAL` | Draft or active → cancelled |
-| `task add GOAL TITLE [--body TEXT] [--test-plan TEXT \| --test-plan-file PATH]` | Add a todo task to a goal |
+| `task add GOAL TITLE [--body TEXT \| --body-file PATH] [--test-plan TEXT \| --test-plan-file PATH]` | Add a todo task to a goal |
+| `task body TASK [--text TEXT \| --file PATH]` | Replace the body (stdin when no flag is given) |
 | `task test-plan TASK [--text TEXT \| --file PATH]` | Replace the validation steps (stdin when no flag is given) |
 | `task pr TASK URL` / `task pr TASK --clear` | Record or remove the pull request that delivers the task |
 | `task list [--project P] [--goal F] [--status S]` | List tasks in ID order |
@@ -180,6 +188,20 @@ the bundled SQLite C library.
 | `tasky-store` | Diesel/SQLite persistence, embedded migrations, transactional operations |
 | `tasky-cli` | The `tasky` binary: arguments, JSON output, and the `ui` subcommand |
 | `tasky-ui` | Read-only GPUI viewer as a library, launched by `tasky ui` |
+
+## Agent skill
+
+`skills/tasky/` is a Claude Code skill that teaches agents the model, the addressing rules,
+and how to plan and execute work with the CLI, including the rule that a plan is recorded
+only once it is aligned with the user. Install it for every session with a symlink:
+
+```sh
+ln -sfn "$PWD/skills/tasky" ~/.claude/skills/tasky
+```
+
+`skills/tasky/reference.md` is generated from the binary by `scripts/update-skill-reference.sh`
+and checked in CI, so it never drifts from the commands. Rerun the script after changing the
+CLI.
 
 Schema changes are Diesel migrations under `crates/tasky-store/migrations`, embedded in the
 binary. Only `tasky init` and `tasky migrate` change a database's schema; every other
