@@ -291,7 +291,7 @@ fn tasks_form_a_gated_graph_within_a_project() {
 }
 
 #[test]
-fn body_test_plan_and_pr_are_fields_on_the_task() {
+fn title_body_test_plan_and_pr_are_fields_on_the_task() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
     setup(p);
@@ -316,6 +316,11 @@ fn body_test_plan_and_pr_are_fields_on_the_task() {
     assert_eq!(task["test_plan"], "1. cargo test\n");
     assert_eq!(task["pr"], Value::Null);
     let id = id(&task);
+    assert_eq!(
+        ok(p, &["task", "title", &id, "Work well"])["title"],
+        "Work well"
+    );
+    assert_eq!(run(p, &["task", "title", &id, " "]).status.code(), Some(1));
     assert_eq!(
         ok(p, &["task", "body", &id, "--text", "Build it well."])["body"],
         "Build it well."

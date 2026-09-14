@@ -190,6 +190,8 @@ enum TaskCommand {
         #[command(flatten)]
         test_plan: TestPlanSource,
     },
+    /// Replace the title
+    Title { task: String, title: String },
     /// Replace the body from --text, --file, or stdin
     Body {
         task: String,
@@ -461,6 +463,7 @@ fn run_task(store: &mut Store, command: TaskCommand) -> Result<Value> {
             body,
             test_plan,
         } => json!(store.create_task(&goal, title, body.read()?, test_plan.read()?)?),
+        TaskCommand::Title { task, title } => json!(store.set_title(&task, title)?),
         TaskCommand::Body { task, source } => json!(store.set_body(&task, source.read()?)?),
         TaskCommand::TestPlan { task, source } => {
             json!(store.set_test_plan(&task, source.read()?)?)

@@ -40,7 +40,7 @@ test plan; `fail` sends it back to in progress and `pass` marks it ready for mer
 records the merge and is allowed only from `ready_for_merge`. `cancel` works from any state
 that is not done or cancelled. No state can be skipped, and done and cancelled are terminal.
 "Blocked" and "ready" are derived, never stored. Dependencies can change only while a task is
-`todo`; the body, test plan, and pull request can change until the task is done or cancelled.
+`todo`; the title, body, test plan, and pull request can change until the task is done or cancelled.
 
 IDs are ULIDs. Refer to a task by any unique prefix or suffix of its ID; the tail is the
 random part, so the last few characters are the easiest to type. Refer to a project by slug.
@@ -112,6 +112,7 @@ Global flags: `--db PATH` (or `TASKY_DB`), `--json`, `--help`, `--version`.
 | `goal complete GOAL` | Active with all tasks finished → complete |
 | `goal cancel GOAL` | Draft or active → cancelled |
 | `task add GOAL TITLE [--body TEXT \| --body-file PATH] [--test-plan TEXT \| --test-plan-file PATH]` | Add a todo task to a goal |
+| `task title TASK TITLE` | Replace the title |
 | `task body TASK [--text TEXT \| --file PATH]` | Replace the body (stdin when no flag is given) |
 | `task test-plan TASK [--text TEXT \| --file PATH]` | Replace the validation steps (stdin when no flag is given) |
 | `task pr TASK URL` / `task pr TASK --clear` | Record or remove the pull request that delivers the task |

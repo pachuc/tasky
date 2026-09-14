@@ -69,6 +69,20 @@ impl Task {
         })
     }
 
+    /// Replace the title of an open task.
+    ///
+    /// # Errors
+    /// Returns an error if the task is done or cancelled, or the title is blank.
+    pub fn set_title(&mut self, title: String, now: Timestamp) -> Result<()> {
+        self.require_open("given a title")?;
+        if title.trim().is_empty() {
+            return Err(Error::Invalid("task title must not be blank".into()));
+        }
+        self.title = title;
+        self.updated_at = now;
+        Ok(())
+    }
+
     /// Replace the body of an open task.
     ///
     /// # Errors
@@ -308,6 +322,7 @@ mod tests {
         assert!(task.set_pr(Some("x".into()), NOW).is_err());
         assert!(task.set_test_plan("x".into(), NOW).is_err());
         assert!(task.set_body("x".into(), NOW).is_err());
+        assert!(task.set_title("x".into(), NOW).is_err());
     }
 
     #[test]
@@ -330,8 +345,11 @@ mod tests {
     }
 
     #[test]
-    fn body_test_plan_and_pr_are_editable_while_open() {
+    fn title_body_test_plan_and_pr_are_editable_while_open() {
         let mut task = task();
+        task.set_title("Build the thing".into(), NOW).unwrap();
+        assert_eq!(task.title, "Build the thing");
+        assert!(task.set_title("  ".into(), NOW).is_err(), "blank title");
         task.set_body("Build the thing.".into(), NOW).unwrap();
         assert_eq!(task.body, "Build the thing.");
         task.set_test_plan("1. run cargo test".into(), NOW).unwrap();
@@ -344,6 +362,7 @@ mod tests {
         task.cancel(NOW).unwrap();
         assert!(task.set_pr(Some("x".into()), NOW).is_err());
         assert!(task.set_body("x".into(), NOW).is_err());
+        assert!(task.set_title("x".into(), NOW).is_err());
     }
 
     #[test]

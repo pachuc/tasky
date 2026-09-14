@@ -929,6 +929,14 @@ impl Store {
         })
     }
 
+    /// Replace the title of an open task.
+    ///
+    /// # Errors
+    /// Returns an error if the task cannot be resolved, is closed, or the title is blank.
+    pub fn set_title(&mut self, reference: &str, title: String) -> Result<Task> {
+        self.update_task(reference, |task, _| Ok(task.set_title(title, now())?))
+    }
+
     /// Replace the body of an open task.
     ///
     /// # Errors
@@ -1464,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn body_test_plan_and_pr_live_on_the_task() {
+    fn title_body_test_plan_and_pr_live_on_the_task() {
         let (_dir, mut store) = store();
         goal(&mut store, "app", "f");
         let task = store
@@ -1472,6 +1480,8 @@ mod tests {
             .unwrap();
         assert_eq!(task.test_plan, "cargo test");
         assert_eq!(task.pr, None);
+        let with_title = store.set_title(&task.id, "Work harder".into()).unwrap();
+        assert_eq!(with_title.title, "Work harder");
         let with_body = store.set_body(&task.id, "Build it.".into()).unwrap();
         assert_eq!(with_body.body, "Build it.");
         let updated = store
@@ -1489,6 +1499,8 @@ mod tests {
         assert!(store.set_pr(&task.id, None).is_err(), "done is frozen");
         assert!(store.set_test_plan(&task.id, "x".into()).is_err());
         assert!(store.set_body(&task.id, "x".into()).is_err());
+        assert!(store.set_title(&task.id, "x".into()).is_err());
+        assert_eq!(done.title, "Work harder");
         assert_eq!(done.body, "Build it.");
         assert_eq!(store.goal_detail("f").unwrap().tasks.done, 1);
     }
