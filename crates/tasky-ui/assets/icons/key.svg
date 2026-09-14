@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="60 60 860 860">
+  <!-- Traced from the reference: the blade runs at 45 degrees, but the tip and the three
+       stair-step cuts are axis-aligned. One outline, then the offset keyhole. -->
+  <g fill="none" stroke="#000" stroke-width="40" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M432 475 L385 525 H325 V580 H270 V635 H215 V690 H160 L125 730 V850 H245 L531 560 A230 230 0 1 0 432 475 Z"/>
+    <circle cx="675" cy="300" r="58"/>
+  </g>
+</svg>

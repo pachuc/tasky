@@ -17,6 +17,7 @@ clap.workspace = true
 serde_json.workspace = true
 tasky-core.workspace = true
 tasky-store.workspace = true
+tasky-ui.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

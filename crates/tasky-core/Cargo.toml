@@ -8,5 +8,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+jiff.workspace = true
 serde.workspace = true
 thiserror.workspace = true

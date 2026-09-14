@@ -7,35 +7,40 @@ through a complete CLI. Provide a GPUI application for understanding current wor
 blocked paths, and ownership. The graph is the source of truth; agent execution is
 outside the initial product. A task may describe coding, research, or human work.
 
-This PR establishes the workspace and a runnable vertical slice. It implements
-local DAG rules, JSON persistence, explicit claims, CLI coverage of the implemented
-operations, and a manually refreshed GPUI task list. The milestones below describe
-future work unless explicitly marked as present. We should stabilize behavior
-before expanding the transport or building an autonomous executor.
+The workspace is a runnable vertical slice: a domain model of projects, goals,
+and tasks; DAG rules in `tasky-core`; Diesel/SQLite persistence with embedded
+migrations; a CLI covering every implemented operation; and a manually refreshed
+GPUI task list. The milestones below describe future work unless explicitly marked
+as present. We should stabilize behavior before expanding the transport or building
+an autonomous executor.
 
 ## 2. Workspace boundaries
 
 ```mermaid
 flowchart TD
     Agent[Agent process] --> CLI[tasky-cli]
-    Human[Human] --> UI[tasky-ui / GPUI]
+    Human[Human] --> CLI
+    CLI -->|tasky ui| UI[tasky-ui / GPUI]
     CLI --> Store[tasky-store]
     UI --> Store
     Store --> Core[tasky-core]
-    Store --> Disk[(Local versioned snapshot)]
+    Store --> Disk[(SQLite database in the user data directory)]
 ```
 
-- **tasky-core** owns `Graph`, `Task`, `Status`, and domain errors. It is synchronous
-  and deterministic, with no filesystem, network, GPUI, clock, or agent execution
-  dependencies. Mutations validate preconditions before changing state. Ordered
-  collections make snapshots and query results reproducible.
-- **tasky-store** owns load, initialize, and locked read-modify-write transactions.
-  Both clients use this boundary. It validates snapshots after reading and before
-  saving. Storage errors retain context without becoming domain policy.
-- **tasky-cli** translates arguments into core operations within store transactions.
-  It owns stdout/stderr formatting and exit codes. No graph rule belongs here.
-- **tasky-ui** renders a read model and refreshes it from the store. It never edits
-  JSON directly. Future UI mutations must use the same application commands as CLI.
+- **tasky-core** owns `Project`, `Goal`, `Task`, `Dependency`, `TaskLink`,
+  their status enums, the `Dag` view, and domain errors. It is synchronous and
+  deterministic, with no filesystem, network, GPUI, clock, or agent execution
+  dependencies; callers pass the current time and generated IDs in. Mutations validate
+  preconditions before changing state. Ordered collections make results reproducible.
+- **tasky-store** owns the SQLite database through Diesel: initialization, embedded
+  migrations, reference resolution, and one immediate transaction per mutation that
+  loads rows, applies a core rule, and writes the result. Both clients use this
+  boundary. Storage errors retain context without becoming domain policy.
+- **tasky-cli** is the one binary and the first-class way to interact with Tasky. It
+  translates arguments into store operations, owns stdout/stderr formatting and exit
+  codes, and launches the viewer through `tasky ui`. No graph rule belongs here.
+- **tasky-ui** is a library that renders a read model loaded from the store. It never
+  edits data. Future UI mutations must use the same store operations as the CLI.
 
 As commands acquire revisions, leases, and events, introduce **tasky-service**
 between clients and storage. It will expose typed `Command` and `Query` enums,
@@ -48,45 +53,71 @@ core toward a client.
 
 ### Present model
 
-A graph has `schema_version: 1` and a map of tasks keyed by caller-chosen string ID.
-Each task has `id`, nonblank `title`, a set of dependency IDs, and a tagged status:
-`pending`, `running { agent }`, `done`, or `failed { reason }`.
+One database holds any number of **projects**, each with a unique slug, a name, and an
+optional repository path and URL; a project is anything work is organized under, and only
+coding projects tend to have a repository. A
+**goal** belongs to a project and has a slug unique within that project, a title, a
+description, an optional **spec** (free text describing the goal in detail), and a status
+(`draft`, `active`, `complete`, `cancelled`). Every **task** belongs directly to a goal and
+has a title, body, test plan (the validation steps that prove it complete), optional pull
+request link, and status (`todo`, `in_progress`, `testing`, `ready_for_merge`, `done`,
+`cancelled`). **Dependencies** are edges between any two tasks in the same project. **Links**
+attach a commit SHA or URL to a task. IDs are ULIDs stored as text; timestamps are RFC 3339 UTC text.
 
-`depend A B` means **A requires B**. Stored adjacency points from dependent to
-prerequisite. A future canvas should draw execution-flow arrows B → A and label
-that convention. A task is ready iff it is pending and every dependency is done.
-Readiness and blocking are derived, never independently persisted.
+`task depend A B` means **A requires B**. Stored adjacency points from dependent to
+prerequisite. A task is ready iff it is todo and every dependency is done; cancelled
+dependencies keep dependents blocked until the edge is removed, and a dependency that is
+still testing or ready for merge blocks too. Readiness and blocking are derived, never
+persisted.
 
-Enforce unique nonblank IDs; matching map keys and task IDs; existing dependency
-endpoints; no self-edges or cycles; nonblank titles, owners, and failure reasons;
-and done prerequisites for every task that has started. Adding A → B checks
-whether B already reaches A before insertion. Traversal is iterative to avoid
-recursive stack overflow. Duplicate edge adds and absent edge removals are no-ops
-when both endpoints exist and the dependent is pending.
+A task moves along one path, `todo → in_progress ⇄ testing → ready_for_merge → done`.
+Testing validates the work against the task's test plan; failing sends it back to in
+progress. Ready for merge means validation passed and the pull request is waiting. Done
+records the merge and is reachable only from ready for merge. Cancellation is allowed from
+every open state.
+
+The database enforces referential integrity, unique project slugs, per-project unique
+goal slugs, status vocabularies, and the absence of self edges. Rust enforces everything
+SQL cannot: acyclicity (checked before every insert, iteratively), edges only between tasks
+of the same project, dependency edits only on todo tasks, starting only with done
+dependencies, one step at a time along the task path, test plan and pull request edits only
+on open tasks, spec and task changes only while the goal is draft or active, and
+completion only when every task is done or cancelled.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Pending: add
-    Pending --> Running: claim when ready
-    Running --> Done: complete by owner
-    Running --> Failed: fail by owner
-    Failed --> Pending: retry
+    state Goal {
+        [*] --> Draft: goal add
+        Draft --> Active: activate
+        Active --> Complete: complete (all tasks closed)
+        Draft --> Cancelled: cancel
+        Active --> Cancelled: cancel
+    }
+    state Task {
+        [*] --> Todo: task add
+        Todo --> InProgress: start (deps done)
+        InProgress --> Testing: test
+        Testing --> InProgress: fail
+        Testing --> ReadyForMerge: pass
+        ReadyForMerge --> Done: done (merged)
+        Todo --> CancelledT: cancel
+        InProgress --> CancelledT: cancel
+        Testing --> CancelledT: cancel
+        ReadyForMerge --> CancelledT: cancel
+    }
 ```
 
-Dependency changes are allowed only on pending tasks. Completing work is terminal;
-there is no reopening done tasks that could invalidate downstream completion.
-Retry does not automatically claim the task. An owner name is a coordination
-convention, not proof of identity. Claim is a single locked transaction so two
-cooperating processes cannot both win. A crashed agent currently leaves work
-running; recovery is an explicit future milestone, not an implicit timeout.
+Completing work is terminal; there is no reopening. Adding an existing dependency or
+link, or removing a missing dependency, is a no-op. Every mutation runs in one SQLite
+immediate transaction, so two cooperating processes cannot both start the same task.
 
 ### Planned extensions
 
-Add descriptions, labels, priority, creation/update times, result summaries, and
-artifact references after versioned migration support. Prefer opaque generated
-IDs with optional caller-specified IDs, and keep identity separate from titles.
-Add task revisions for compare-and-swap updates and graph revisions for snapshot
-freshness. Define cancellation and archival instead of silently deleting evidence.
+Add labels, priority, assignees, result summaries, and artifact references as
+migrations. Add task revisions for compare-and-swap updates and a project revision
+for snapshot freshness. Decide whether a spec should gain versions or a frozen state
+(currently it is plain editable text). Define cancellation and archival instead of
+silently deleting evidence.
 Hard deletion, if supported, must reject incoming dependencies unless an explicit
 transactional cascade is requested. Never invalidate completed work silently.
 
@@ -101,54 +132,50 @@ cancellation propagates (initial proposal: explicit action, no hidden propagatio
 
 ### Present adapter
 
-Each store directory contains `graph.json` and a persistent `graph.lock` file.
-A mutation takes an exclusive advisory lock, reloads and validates current state,
-applies the operation, validates again, writes a temporary file in the same
-directory, flushes it, and atomically replaces the snapshot. Unix additionally
-syncs the directory. Dropping the lock handle releases the lock on success or
-error. Failed operations before replacement leave the previous snapshot intact.
-Readers see an old or new complete snapshot without locking. Initialization takes
-the same lock and refuses an existing snapshot. Never delete or replace the lock
-file while processes are using the store.
+The store is one SQLite file shared by every project, `tasky/tasky.db` under
+`$XDG_DATA_HOME` (falling back to `~/.local/share`) by default, accessed through Diesel with
+the bundled SQLite library. `--db` or `TASKY_DB` selects another file. Migrations live in `crates/tasky-store/migrations` and are
+embedded in the binary; `schema.rs` is maintained by hand to match them. Only `init`
+and `migrate` change the schema. Opening a database with pending migrations fails and
+names the fix, so a newer binary never rewrites the user's database as a side
+effect of a read. Every connection enables foreign keys and a five-second busy timeout.
+`init` refuses to overwrite an existing file.
 
-This is for small local graphs and cooperating processes. It is not a distributed
-lock or a network-filesystem protocol. If a sync or output error occurs after the
-replacement, a command can report failure even though its mutation committed;
-agents must inspect state before retrying. Request IDs and deduplication will
-resolve this ambiguity later. Atomic replacement does not itself provide backups.
+Each mutation is one immediate transaction: resolve references, load the rows the rule
+needs (for graph rules, every task and edge), apply the `tasky-core` operation, write the
+result. SQLite's own locking replaces the previous advisory lock file. Edges never cross
+projects, so the union of every project's tasks is still a DAG and one whole-graph load
+serves every query. That is fine at the intended scale of roughly a hundred tasks per
+project; scope the load per project if it ever is not.
 
-### Next adapter
+Projects resolve by slug or by a unique prefix or suffix of an ID. Goals resolve as
+`project/slug`, by a slug that only one project uses, or by an ID fragment. Tasks resolve
+by ID fragment only. ULIDs start with a millisecond timestamp, so IDs created close
+together share a long prefix; the random tail is what humans type.
 
-Move to SQLite when indexed queries, events, leases, or larger graphs justify it.
-Keep core rules independent of SQL. Use foreign keys, a migration table, short
-transactions and a bounded busy timeout. Claim selection and transition must
-happen in one transaction. Store task updates and their append-only domain events
-in the same commit. Candidate tables: `graphs`, `tasks`, `dependencies`, `attempts`,
-`events`, and `requests` (idempotency keys). Establish backup and restore commands
-before making schema upgrades automatic.
+### Relationship to repositories
 
-Build a validated importer for v1 snapshots, then compare imported readiness and
-status against the old adapter with shared conformance tests. Preserve the old
-file until verification succeeds. Unsupported versions must fail with a useful
-message, never reset the graph. SQLite remains single-host initially; a server
-transport is a separate decision driven by actual multi-host requirements.
+Projects are not repositories. A coding project may record the repository it is tied to
+as a local `repo_path`, a remote `repo_url`, or both, but the database lives outside every
+repository and is never committed. Backup and export are project-lifecycle commands (below); a repository refers
+to its work through task pull requests and links, not by carrying task state.
 
 ## 5. CLI as the complete automation surface
 
 Every supported domain action must have a CLI operation before it can be considered
-finished. The scaffold exposes init, add, list, show, depend, undepend, ready,
-claim, complete, fail, retry, snapshot, and validate; README specifies current
-arguments and output shapes. Mutations currently return the full snapshot.
+finished. The CLI exposes `init`, `migrate`, and the `project`, `goal`, and `task`
+command groups; README specifies current arguments and output shapes. Mutations return
+the affected record.
 
 Evolve the CLI in these groups:
 
 | Area | Planned commands / behavior |
 | --- | --- |
-| Graph lifecycle | import/export, backup/restore, migrate |
-| Tasks | edit, label, filter, cancel, archive; deliberate deletion policy |
-| Dependencies | list blockers/dependents, explain readiness, topological order |
+| Project lifecycle | rename, archive, export/import, backup/restore, migration policy |
+| Goals | edit titles/descriptions, spec history, reopen policy, deletion policy |
+| Tasks | edit, label, priority, archive |
 | Agent coordination | claim-next, heartbeat, release, reclaim, attempt history |
-| Observation | graph summary, event history, watch with NDJSON |
+| Observation | project summary, event history, watch with NDJSON |
 
 Before a stable release, define versioned response envelopes, typed error codes,
 pagination/cursors, expected-revision flags, and idempotency keys for mutations.
@@ -161,10 +188,12 @@ priority and ID rules. Never implement it as `ready` followed by an unlocked wri
 
 ## 6. GPUI visualization
 
-Use published GPUI 0.2.2, pinned in the UI manifest, with native dependencies
-isolated from default headless builds. Start with the existing list showing IDs,
-titles, state, owners/reasons, and dependencies. Startup failures are explicit;
-refresh failures retain the last good view and mark it as stale.
+Use published GPUI 0.2.2, pinned in the UI manifest. The viewer is compiled into the
+`tasky` binary and started with `tasky ui`, so one install covers both surfaces. The present viewer is a monochrome, pannable,
+zoomable graph: a pure layout module (unit-tested without a display) places projects,
+goals, and tasks in left-to-right columns by hierarchy and dependency rank, and a single
+canvas paints circles, edges, and labels. Dependencies are optimized even in dev builds
+so the viewer stays smooth without a release build. Startup failures are explicit.
 
 Next, introduce a view model containing task summaries, edges, selection, filters,
 and observed revision. Load on a background executor, deliver immutable snapshots
@@ -172,35 +201,32 @@ to the GPUI entity, then notify it. Coalesce changes and discard out-of-order
 responses. Filesystem notifications are hints: debounce and reload, with polling
 fallback. Preserve selection by task ID across refreshes.
 
-Build a layered DAG layout using topological ranks, stable sibling ordering, and
-separate layout coordinates from domain data. Render prerequisite-to-dependent
-edges, state badges, a legend, pan/zoom, search, and a details panel. Show blockers
-and ownership as text as well as color. Retain the list as a keyboard-friendly
-alternative; virtualize large views. Do not recompute expensive layout on every
-paint. Add editing only after typed service commands and stale-revision handling
+Next, reduce edge crossings with barycentric sibling ordering, add a background
+refresh, search, and a details view, and show state through shape and text rather than
+color so the graph stays black and white. Virtualize large views and never recompute
+layout on paint; layout runs once per snapshot today. Add editing only after typed service commands and stale-revision handling
 exist, and expose the same action in CLI. Initially target Linux and macOS; validate
 Windows separately before claiming support.
 
 ## 7. Build milestones and acceptance criteria
 
-1. **Scaffold (this PR).** Four crates, pinned toolchain and lockfile, local graph
-   workflow, CLI JSON output, GPUI list, docs, and a CI template. Accept when headless tests and
-   lint pass, and desktop source type-checks on a supported platform. Manually
-   verify launch/refresh/scroll/close on a machine with a display before release.
-2. **Domain and contract hardening.** Typed IDs, revisions, edit/cancel/archive,
-   descriptions/results, structured service commands, stable JSON/error schemas.
-   Accept when every action has a CLI command, rejected operations leave state
-   unchanged, and checked-in examples match integration-test output.
-3. **Durable history.** SQLite repository, schema migrations, events, backup and
-   v1 importer. Accept with crash/rollback tests, adapter conformance tests, and
-   restore verification; no silent data loss or partial import.
-4. **Reliable agent scheduling.** Leases, heartbeat/release/reclaim, claim-next,
+1. **Scaffold (present).** Four crates, pinned toolchain and lockfile, the
+   project/goal/task model on SQLite, CLI JSON output, GPUI list, docs, and a CI
+   template. Accept when tests and lint pass on Linux, and desktop source
+   type-checks on a supported platform. Manually verify launch/refresh/scroll/close
+   on a machine with a display before release.
+2. **Domain and contract hardening.** Revisions, edit/archive, spec history,
+   structured service commands, stable JSON/error schemas, events, export/import and
+   backup/restore of the shared database. Accept when every action has a CLI command,
+   rejected operations leave state unchanged, and checked-in examples match
+   integration-test output.
+3. **Reliable agent scheduling.** Leases, heartbeat/release/reclaim, claim-next,
    idempotency and attempt history. Accept with competing-process tests, controlled
    clock tests, stale-token rejection, and recovery after an agent dies mid-task.
-5. **Live graph UI.** Background refresh, graph canvas, filters, details and keyboard
+4. **Live graph UI.** Background refresh, graph canvas, filters, details and keyboard
    navigation. Accept with stable layout tests and manual Linux/macOS checks that
    CLI mutations appear without restart and errors retain a labeled last good view.
-6. **Release readiness.** CLI reference generated from help, example agent loop,
+5. **Release readiness.** CLI reference generated from help, example agent loop,
    platform packaging, migration policy and performance budgets. Benchmark chain,
    fan-in/fan-out and disconnected graphs at 1k/10k tasks before selecting targets.
    Publish a supported-platform matrix and recovery documentation.
@@ -213,17 +239,20 @@ and distributed scheduling are out of scope until the local contract is stable.
 ## 8. Validation strategy and risks
 
 Present tests cover cycle rejection, missing endpoints, dependency-gated readiness,
-owner checks, failure/retry, snapshot rollback, unsupported schema, concurrent
-writers, and end-to-end CLI workflows including competing process claims.
-The CI template runs formatting, headless tests/lints, and a macOS UI check.
+the full task path including the testing loop and the rule that no state can be skipped,
+test plan and pull request edits, goal lifecycle with an optional spec, slug and link validation,
+per-project goal slugs and `project/slug` resolution including ambiguity, isolation
+of dependencies and scopes between projects, concurrent connections racing to start a
+task, and end-to-end CLI workflows including competing processes.
+The CI template runs formatting, tests, and lints on Linux with GPUI build packages installed, plus a macOS Clippy check.
 It must be copied from `ci/github-actions.yml.example` to `.github/workflows/ci.yml`
 with workflow-authorized credentials before GitHub Actions will run it.
 
 Add property tests that generate arbitrary DAGs and attempted mutations; after
-success validate invariants, after rejection compare the full snapshot. Add
-fault injection around write/rename/sync, corrupt/truncated snapshot fixtures,
-and multi-process contention stress tests. Migration tests must load old fixtures,
-upgrade, reopen, and preserve task identities and dependency semantics.
+success validate invariants, after rejection compare the full database. Add
+corrupt-database fixtures and multi-process contention stress tests. Migration
+tests must load old fixtures, upgrade, reopen, and preserve task identities and
+dependency semantics.
 
 GPUI compilation is not a visual test. A desktop smoke checklist must cover empty
 and populated stores, long titles/reasons, many tasks, resize/scroll, refresh after
@@ -231,8 +260,9 @@ CLI edits, malformed data, missing files, and closing the last window. Later add
 view-model and layout tests independent of a GPU, plus platform smoke jobs where
 runners permit a real display.
 
-Main risks: GPUI platform churn (pin and upgrade deliberately); whole-snapshot cost
-(benchmark before SQLite migration); stale workers (claim tokens and leases);
+Main risks: GPUI platform churn (pin and upgrade deliberately); one shared database
+for every project (back it up, and keep schema upgrades explicit); stale workers
+(claim tokens and leases);
 contract drift (CLI fixtures and shared service layer); event/state divergence
 (one transaction); and unclear dependency semantics (one documented direction and
 core invariants). Keep agent-provided text as data and never execute it implicitly.

@@ -9,7 +9,13 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-serde_json.workspace = true
+diesel.workspace = true
+diesel_migrations.workspace = true
+jiff.workspace = true
+libsqlite3-sys.workspace = true
+serde.workspace = true
 tasky-core.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
 tempfile.workspace = true
-fs2 = "0.4"
