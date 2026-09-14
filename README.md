@@ -4,7 +4,7 @@ Track any number of projects, each made of goals with a DAG of tasks, in one SQL
 database kept outside your repositories. A project can be anything: a codebase, a research
 effort, a launch. A CLI drives the workflow and emits JSON for
 automation; a GPUI desktop viewer shows the graph. This is an early scaffold with a working
-workflow and a [detailed implementation plan](plan.md).
+workflow.
 
 ## Model
 
@@ -190,4 +190,3 @@ is not required.
 [GitHub Actions CI](.github/workflows/ci.yml) runs tests and checks on Linux, installing
 GPUI's build packages first, and Clippy for the whole workspace on macOS. The same workflow
 is provided at [`ci/github-actions.yml.example`](ci/github-actions.yml.example).
-See [plan.md](plan.md) for architecture, milestones, and acceptance tests.
