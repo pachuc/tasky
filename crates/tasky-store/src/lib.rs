@@ -825,6 +825,22 @@ impl Store {
         })
     }
 
+    /// Reopen a complete goal so new tasks can be added. A sub-goal can only be reopened while
+    /// its parent goal is still open, so a complete parent never hides active work.
+    ///
+    /// # Errors
+    /// Returns an error if the goal cannot be resolved, is not complete, or its parent is
+    /// closed.
+    pub fn reopen_goal(&mut self, reference: &str) -> Result<Goal> {
+        self.update_goal(reference, |goal, conn| {
+            if let Some(parent_id) = &goal.parent_id {
+                let parent = find_goal(conn, parent_id)?;
+                parent.require_open()?;
+            }
+            Ok(goal.reopen(now())?)
+        })
+    }
+
     /// Cancel a draft or active goal whose sub-goals are all closed.
     ///
     /// # Errors

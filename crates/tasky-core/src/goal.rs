@@ -129,6 +129,24 @@ impl Goal {
         Ok(())
     }
 
+    /// Reopen a complete goal so more tasks can be added to it. The completion time is
+    /// cleared; the goal completes again once the new work is finished.
+    ///
+    /// # Errors
+    /// Returns an error if the goal is not complete.
+    pub fn reopen(&mut self, now: Timestamp) -> Result<()> {
+        if self.status != GoalStatus::Complete {
+            return Err(Error::Invalid(format!(
+                "goal {} is {} and cannot be reopened",
+                self.slug, self.status
+            )));
+        }
+        self.status = GoalStatus::Active;
+        self.updated_at = now;
+        self.completed_at = None;
+        Ok(())
+    }
+
     /// Cancel a draft or active goal whose sub-goals are all closed. Its own tasks may stay
     /// open, as before; cancelling never invalidates finished work silently.
     ///
@@ -315,5 +333,19 @@ mod tests {
             .cancel(std::slice::from_ref(&done_child), now())
             .unwrap();
         assert_eq!(other.status, GoalStatus::Cancelled);
+    }
+
+    #[test]
+    fn a_complete_goal_can_be_reopened_and_completed_again() {
+        let mut goal = goal_named("G1", None);
+        assert!(goal.reopen(now()).is_err());
+        goal.activate(now()).unwrap();
+        assert!(goal.reopen(now()).is_err());
+        goal.complete(&[], &[], now()).unwrap();
+        goal.reopen(now()).unwrap();
+        assert_eq!(goal.status, GoalStatus::Active);
+        assert!(goal.completed_at.is_none());
+        goal.complete(&[], &[], now()).unwrap();
+        assert_eq!(goal.status, GoalStatus::Complete);
     }
 }

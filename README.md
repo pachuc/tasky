@@ -24,7 +24,8 @@ workflow.
   write. Dependencies never cross from one root project to another.
 - A **link** attaches a commit SHA or URL to a task.
 
-Goals go `draft → active → complete` or `cancelled`. A goal completes only when every task
+Goals go `draft → active → complete` or `cancelled`, and a complete goal can be reopened to
+active when more work turns up. A goal completes only when every task
 directly under it is done or cancelled and every sub-goal is complete or cancelled, so a
 parent can never close ahead of its children. Cancelling likewise waits for sub-goals to
 close. A spec can be written, replaced, or cleared while its goal is draft or active.
@@ -110,6 +111,7 @@ Global flags: `--db PATH` (or `TASKY_DB`), `--json`, `--help`, `--version`.
 | `goal spec GOAL [--text TEXT \| --file PATH \| --clear]` | Replace the spec (stdin when no flag is given) or remove it |
 | `goal activate GOAL` | Draft → active |
 | `goal complete GOAL` | Active with all tasks finished → complete |
+| `goal reopen GOAL` | Complete → active, so more tasks can be added; the parent goal must be open |
 | `goal cancel GOAL` | Draft or active → cancelled |
 | `task add GOAL TITLE [--body TEXT \| --body-file PATH] [--test-plan TEXT \| --test-plan-file PATH]` | Add a todo task to a goal |
 | `task title TASK TITLE` | Replace the title |

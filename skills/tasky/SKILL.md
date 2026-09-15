@@ -34,7 +34,7 @@ Corollaries:
 | Thing | What it is | Status |
 | --- | --- | --- |
 | Project | Anything work is organized under. May have a parent project. May record a repo path and URL. | none |
-| Goal | A high-level outcome inside a project, with an optional spec. May have a parent goal in the same project. | `draft → active → complete`, or `cancelled` |
+| Goal | A high-level outcome inside a project, with an optional spec. May have a parent goal in the same project. | `draft → active → complete`, or `cancelled`; complete can be reopened to active |
 | Task | The unit of work: title, body, test plan, pull request, dependencies, links. | `todo → in_progress ⇄ testing → ready_for_merge → done`, or `cancelled` |
 
 Rules the CLI enforces, so plan around them:
@@ -46,6 +46,9 @@ Rules the CLI enforces, so plan around them:
 - Dependencies can be edited only while a task is `todo`. They may join any two tasks under
   the same root project, sub-projects included, never across root projects. Cycles are
   rejected.
+- A complete goal can be reopened with `goal reopen` when feedback produces more work; it
+  goes back to `active` and completes again once the new tasks close. A sub-goal can only be
+  reopened while its parent is open.
 - A goal completes only when its own tasks are all `done` or `cancelled` and every sub-goal
   is `complete` or `cancelled`. Cancelling a goal also waits for its sub-goals to close.
 - Closed goals accept no new tasks or sub-goals. Titles, bodies, test plans, and pull

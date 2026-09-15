@@ -262,6 +262,7 @@ Commands:
   spec      Replace the spec from --text, --file, or stdin, or clear it with --clear
   activate  Move a draft goal into active work
   complete  Complete an active goal whose tasks are all finished
+  reopen    Reopen a complete goal so more tasks can be added
   cancel    Cancel a draft or active goal
   help      Print this message or the help of the given subcommand(s)
 
@@ -436,6 +437,31 @@ Options:
 Complete an active goal whose tasks are all finished
 
 Usage: tasky goal complete [OPTIONS] <GOAL>
+
+Arguments:
+  <GOAL>
+          
+
+Options:
+      --db <DB>
+          Path to the SQLite database
+          
+          [env: TASKY_DB=]
+          [default: $XDG_DATA_HOME/tasky/tasky.db]
+
+      --json
+          Emit compact machine-readable JSON (errors go to stderr as JSON too)
+
+  -h, --help
+          Print help
+```
+
+## `tasky goal reopen`
+
+```text
+Reopen a complete goal so more tasks can be added
+
+Usage: tasky goal reopen [OPTIONS] <GOAL>
 
 Arguments:
   <GOAL>

@@ -117,6 +117,8 @@ enum GoalCommand {
     Activate { goal: String },
     /// Complete an active goal whose tasks are all finished
     Complete { goal: String },
+    /// Reopen a complete goal so more tasks can be added
+    Reopen { goal: String },
     /// Cancel a draft or active goal
     Cancel { goal: String },
 }
@@ -451,6 +453,7 @@ fn run_goal(store: &mut Store, command: GoalCommand) -> Result<Value> {
         }
         GoalCommand::Activate { goal } => json!(store.activate_goal(&goal)?),
         GoalCommand::Complete { goal } => json!(store.complete_goal(&goal)?),
+        GoalCommand::Reopen { goal } => json!(store.reopen_goal(&goal)?),
         GoalCommand::Cancel { goal } => json!(store.cancel_goal(&goal)?),
     })
 }
